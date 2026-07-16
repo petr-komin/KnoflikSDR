@@ -5,6 +5,7 @@
 
 mod audio;
 mod bandplan;
+mod decode;
 mod dsp;
 mod radio;
 mod settings;
@@ -130,6 +131,8 @@ struct App {
     /// Po skoku za roh se má doladit na nejsilnější stanici, ale až se
     /// panorama ustálí - proto až po tomto čase.
     snap_at: Option<std::time::Instant>,
+    /// Text z dekodéru. Drží se v GUI, aby přežil vypnutí dekodéru.
+    console: String,
     /// RGBA buffer vodopádu, řádek 0 = nejnovější.
     wf_pixels: Vec<u8>,
     wf_tex: Option<egui::TextureHandle>,
@@ -154,6 +157,7 @@ impl App {
             drag_bw: false,
             show_manage: false,
             snap_at: None,
+            console: String::new(),
             wf_pixels: vec![0; FFT_SIZE * WF_HEIGHT * 4],
             wf_tex: None,
             last_generation: 0,
@@ -340,6 +344,90 @@ impl App {
         c.swap_iq = self.set.swap_iq;
         c.bandwidth_hz = self.bandwidth_hz();
         c.mode = self.set.mode;
+        c.decoder = self.set.decoder;
+        c.rtty = decode::RttyConfig {
+            reverse: self.set.rtty_reverse,
+            ..Default::default()
+        };
+    }
+
+    /// Konzole s textem z dekodéru.
+    fn console_panel(&mut self, ui: &mut egui::Ui) {
+        // Vyzvedneme, co dekodér mezitím přečetl.
+        if let Ok(mut d) = self.shared.decoded.lock() {
+            if !d.is_empty() {
+                self.console.push_str(&d);
+                d.clear();
+            }
+        }
+        // Historii držíme na uzdě.
+        if self.console.len() > 16_384 {
+            let cut = self.console.len() - 8_192;
+            // Řez musí padnout na hranici znaku, jinak by to panikařilo.
+            let cut = (cut..self.console.len())
+                .find(|&i| self.console.is_char_boundary(i))
+                .unwrap_or(self.console.len());
+            self.console = self.console[cut..].to_string();
+        }
+
+        egui::Panel::bottom("konzole")
+            .resizable(true)
+            .default_size(160.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("dekodér:");
+                    for d in [decode::Decoder::Off, decode::Decoder::Rtty, decode::Decoder::Cw] {
+                        ui.selectable_value(&mut self.set.decoder, d, d.label());
+                    }
+                    if self.set.decoder == decode::Decoder::Rtty {
+                        ui.separator();
+                        ui.checkbox(&mut self.set.rtty_reverse, "reverse")
+                            .on_hover_text("prohodí mark a space - v éteru se běžně vyskytuje obojí");
+                        ui.label(
+                            egui::RichText::new("45,45 Bd · 170 Hz shift").weak(),
+                        );
+                    }
+                    if self.set.decoder == decode::Decoder::Cw {
+                        ui.separator();
+                        let wpm = self.shared.cw_wpm();
+                        ui.label(egui::RichText::new(format!("~{wpm:.0} WPM")).weak())
+                            .on_hover_text("odhadnuté tempo, dekodér si ho odvozuje sám");
+                    }
+                    ui.separator();
+                    if ui.button("smazat").clicked() {
+                        self.console.clear();
+                    }
+                    if ui.button("zavřít").clicked() {
+                        self.set.show_console = false;
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let text = if self.console.is_empty() {
+                            match self.set.decoder {
+                                decode::Decoder::Off => "Dekodér je vypnutý.".to_string(),
+                                decode::Decoder::Rtty => {
+                                    "Nalaď tak, aby značka ladění byla mezi oběma tóny RTTY.\n                                     Když text vypadá jako nesmysl, zkus reverse."
+                                        .to_string()
+                                }
+                                decode::Decoder::Cw => {
+                                    "Nalaď na tón CW a přiškrť šířku pásma.".to_string()
+                                }
+                            }
+                        } else {
+                            self.console.clone()
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(text).monospace(),
+                            )
+                            .wrap(),
+                        );
+                    });
+            });
     }
 
     /// Řada tlačítek pásem. Barva odpovídá bandplanu, takže rozhlasová
@@ -878,6 +966,8 @@ impl eframe::App for App {
                 ui.checkbox(&mut self.set.swap_iq, "prohodit I/Q");
                 ui.checkbox(&mut self.set.show_bandplan, "bandplan")
                     .on_hover_text("podbarvení úseků pásem (IARU R1)");
+                ui.checkbox(&mut self.set.show_console, "konzole")
+                    .on_hover_text("dekódovaný text z RTTY a CW");
                 ui.separator();
                 let (bw_min, bw_max) = radio::bandwidth_range(self.set.mode);
                 let mut bw_khz = self.bandwidth_hz() / 1000.0;
@@ -929,6 +1019,10 @@ impl eframe::App for App {
 
         self.favourites_panel(ui);
         self.manage_window(&ctx);
+        // Konzole až po stavovém řádku, ať sedí nad ním.
+        if self.set.show_console {
+            self.console_panel(ui);
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             let full = ui.available_rect_before_wrap();

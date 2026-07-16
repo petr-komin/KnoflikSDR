@@ -1,5 +1,6 @@
 //! Vlákno příjmu: ALSA capture -> DSP -> audio ring + spektrum pro GUI.
 
+use crate::decode::{Decoder, RttyConfig};
 use crate::dsp::{Demod, Mode};
 use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, ValueOr};
@@ -55,6 +56,8 @@ pub struct Controls {
     /// Celková šířka propustného pásma demodulátoru.
     pub bandwidth_hz: f64,
     pub mode: Mode,
+    pub decoder: Decoder,
+    pub rtty: RttyConfig,
 }
 
 impl Default for Controls {
@@ -65,6 +68,8 @@ impl Default for Controls {
             swap_iq: false,
             bandwidth_hz: AM_BANDWIDTH_HZ,
             mode: Mode::Am,
+            decoder: Decoder::Off,
+            rtty: RttyConfig::default(),
         }
     }
 }
@@ -91,10 +96,14 @@ pub struct Shared {
     pub status: Mutex<String>,
     /// Stav SoftRocku na USB. Zvlášť, ať si to dvě vlákna nepřepisují.
     pub hw_status: Mutex<String>,
+    /// Text z dekodéru, který si GUI průběžně vyzvedává.
+    pub decoded: Mutex<String>,
     /// Skutečná vzorkovací frekvence vstupu = šířka panoramatu.
     pub sample_rate: AtomicU32,
     /// Úroveň naladěného signálu v dBFS před AGC, uložená jako bity f32.
     pub level_dbfs: AtomicU32,
+    /// Odhadnuté tempo CW ve WPM (bity f32), 0 = neběží CW dekodér.
+    pub cw_wpm: AtomicU32,
     pub running: Arc<AtomicBool>,
 }
 
@@ -105,14 +114,20 @@ impl Shared {
             spectrum: Mutex::new(Spectrum::default()),
             status: Mutex::new("startuji...".to_string()),
             hw_status: Mutex::new("hledám SoftRock...".to_string()),
+            decoded: Mutex::new(String::new()),
             sample_rate: AtomicU32::new(96_000),
             level_dbfs: AtomicU32::new((-120.0f32).to_bits()),
+            cw_wpm: AtomicU32::new(0f32.to_bits()),
             running: Arc::new(AtomicBool::new(true)),
         }
     }
 
     pub fn level_dbfs(&self) -> f32 {
         f32::from_bits(self.level_dbfs.load(Ordering::Relaxed))
+    }
+
+    pub fn cw_wpm(&self) -> f32 {
+        f32::from_bits(self.cw_wpm.load(Ordering::Relaxed))
     }
 }
 
@@ -237,13 +252,22 @@ fn run(device: &str, shared: &Arc<Shared>, audio_tx: &mut rtrb::Producer<f32>) -
             continue;
         }
 
-        let (offset, volume, swap, bandwidth, mode) = {
+        let (offset, volume, swap, bandwidth, mode, decoder, rtty) = {
             let c = shared.controls.lock().unwrap();
-            (c.offset_hz, c.volume, c.swap_iq, c.bandwidth_hz, c.mode)
+            (
+                c.offset_hz,
+                c.volume,
+                c.swap_iq,
+                c.bandwidth_hz,
+                c.mode,
+                c.decoder,
+                c.rtty,
+            )
         };
         rx.set_offset(offset);
         rx.set_mode(mode);
         rx.set_bandwidth(bandwidth);
+        rx.set_decoder(decoder, rtty);
 
         iq.clear();
         for f in 0..frames {
@@ -288,6 +312,24 @@ fn run(device: &str, shared: &Arc<Shared>, audio_tx: &mut rtrb::Producer<f32>) -
         shared
             .level_dbfs
             .store(rx.level_dbfs().to_bits(), Ordering::Relaxed);
+
+        shared.cw_wpm.store(
+            (rx.cw_wpm().unwrap_or(0.0) as f32).to_bits(),
+            Ordering::Relaxed,
+        );
+
+        // Přečtený text předáme GUI. Kdyby si ho nikdo nebral, necháme
+        // ho useknout, ať paměť neroste donekonečna.
+        let text = rx.take_text();
+        if !text.is_empty() {
+            if let Ok(mut d) = shared.decoded.lock() {
+                d.push_str(&text);
+                if d.len() > 8192 {
+                    let cut = d.len() - 4096;
+                    *d = d[cut..].to_string();
+                }
+            }
+        }
         for s in &audio {
             // Když ring přeteče, vzorek zahodíme - výstup si drží tempo sám.
             let _ = audio_tx.push(s * volume);

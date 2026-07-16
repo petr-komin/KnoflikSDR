@@ -3,6 +3,7 @@
 //! Zápis je odložený o `SAVE_DELAY` od poslední změny, aby tažení posuvníku
 //! nepsalo na disk každý snímek.
 
+use crate::decode::Decoder;
 use crate::dsp::Mode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -51,6 +52,10 @@ pub struct Settings {
     pub zoom: f32,
     /// Podbarvovat úseky pásem podle bandplanu?
     pub show_bandplan: bool,
+    pub decoder: Decoder,
+    /// RTTY má v éteru běžně obě polarity, tak ať jde přehodit.
+    pub rtty_reverse: bool,
+    pub show_console: bool,
     pub stations: Vec<Station>,
     /// Poslední místo na každém pásmu, klíčem je název z bandplanu.
     /// BTreeMap kvůli stabilnímu pořadí v souboru.
@@ -73,6 +78,9 @@ impl Default for Settings {
             window_h: 700.0,
             zoom: 1.0,
             show_bandplan: true,
+            decoder: Decoder::Off,
+            rtty_reverse: false,
+            show_console: false,
             stations: Vec::new(),
             band_memory: BTreeMap::new(),
         }
@@ -253,6 +261,9 @@ mod tests {
             window_h: 800.0,
             zoom: 4.0,
             show_bandplan: false,
+            decoder: Decoder::Rtty,
+            rtty_reverse: true,
+            show_console: true,
             band_memory: BTreeMap::new(),
             stations: vec![
                 Station {

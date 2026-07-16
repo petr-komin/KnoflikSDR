@@ -7,6 +7,7 @@
 //! přesně to dělá z I/Q jednopásmový příjem: propustíme jen jednu stranu
 //! spektra a reálná složka výsledku je rovnou zvuk.
 
+use crate::decode::{CwDecoder, Decoder, RttyConfig, RttyDecoder};
 use num_complex::Complex32;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
@@ -124,7 +125,7 @@ pub struct FirDecim {
     hist: Vec<Complex32>,
     mask: usize,
     idx: usize,
-    decim: usize,
+    pub decim: usize,
     phase: usize,
 }
 
@@ -245,6 +246,28 @@ pub struct Demod {
     offset_hz: f64,
     bandwidth_hz: f64,
     mode: Mode,
+    /// Dekodér digitálních režimů. Bere komplexní pásmo za filtrem,
+    /// tedy před detekcí i AGC.
+    decoder: DecoderState,
+    /// Co dekodér přečetl, než si to odtud někdo vyzvedne.
+    decoded: String,
+}
+
+/// Běžící dekodér. Drží se stranou od `Decoder`, což je jen volba režimu.
+enum DecoderState {
+    Off,
+    Rtty(Box<RttyDecoder>),
+    Cw(Box<CwDecoder>),
+}
+
+impl DecoderState {
+    fn kind(&self) -> Decoder {
+        match self {
+            DecoderState::Off => Decoder::Off,
+            DecoderState::Rtty(_) => Decoder::Rtty,
+            DecoderState::Cw(_) => Decoder::Cw,
+        }
+    }
 }
 
 impl Demod {
@@ -260,7 +283,46 @@ impl Demod {
             offset_hz: 0.0,
             bandwidth_hz,
             mode,
+            decoder: DecoderState::Off,
+            decoded: String::new(),
         }
+    }
+
+    /// Přepne dekodér. Rozdělaný znak se zahodí, což je při přepnutí v pořádku.
+    pub fn set_decoder(&mut self, kind: Decoder, rtty: RttyConfig) {
+        let rate = self.out_rate();
+        let same_rtty = match &self.decoder {
+            DecoderState::Rtty(d) => {
+                let c = d.config();
+                c.reverse == rtty.reverse && c.baud == rtty.baud && c.shift_hz == rtty.shift_hz
+            }
+            _ => false,
+        };
+        if self.decoder.kind() == kind && (kind != Decoder::Rtty || same_rtty) {
+            return;
+        }
+        self.decoder = match kind {
+            Decoder::Off => DecoderState::Off,
+            Decoder::Rtty => DecoderState::Rtty(Box::new(RttyDecoder::new(rate, rtty))),
+            Decoder::Cw => DecoderState::Cw(Box::new(CwDecoder::new(rate))),
+        };
+    }
+
+    fn out_rate(&self) -> f64 {
+        self.in_rate / self.fir.decim as f64
+    }
+
+    /// Odhad tempa CW ve WPM, pokud zrovna běží CW dekodér.
+    pub fn cw_wpm(&self) -> Option<f64> {
+        match &self.decoder {
+            DecoderState::Cw(d) => Some(d.wpm()),
+            _ => None,
+        }
+    }
+
+    /// Vyzvedne přečtený text a vyprázdní vnitřní zásobník.
+    pub fn take_text(&mut self) -> String {
+        std::mem::take(&mut self.decoded)
     }
 
     pub fn set_offset(&mut self, hz: f64) {
@@ -304,6 +366,21 @@ impl Demod {
         for &x in iq {
             let mixed = x * self.nco.next();
             if let Some(z) = self.fir.push(mixed) {
+                // Dekodér dostane pásmo za filtrem, ale před detekcí a AGC -
+                // AGC by mu rozhoupala úrovně pod rukama.
+                match &mut self.decoder {
+                    DecoderState::Off => {}
+                    DecoderState::Rtty(d) => {
+                        if let Some(c) = d.push(z) {
+                            self.decoded.push(c);
+                        }
+                    }
+                    DecoderState::Cw(d) => {
+                        if let Some(c) = d.push(z) {
+                            self.decoded.push(c);
+                        }
+                    }
+                }
                 let detected = match self.mode {
                     // AM: obálka komplexního signálu.
                     Mode::Am => z.norm(),
