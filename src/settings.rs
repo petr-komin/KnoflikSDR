@@ -37,6 +37,10 @@ pub struct Settings {
     pub db_max: f32,
     pub window_w: f32,
     pub window_h: f32,
+    /// Přiblížení panoramatu: 1 = celá vzorkovačka, 8 = osmina.
+    pub zoom: f32,
+    /// Podbarvovat úseky pásem podle bandplanu?
+    pub show_bandplan: bool,
     pub stations: Vec<Station>,
 }
 
@@ -54,6 +58,8 @@ impl Default for Settings {
             db_max: -20.0,
             window_w: 1100.0,
             window_h: 700.0,
+            zoom: 1.0,
+            show_bandplan: true,
             stations: Vec::new(),
         }
     }
@@ -231,6 +237,8 @@ mod tests {
             db_max: -30.0,
             window_w: 1280.0,
             window_h: 800.0,
+            zoom: 4.0,
+            show_bandplan: false,
             stations: vec![
                 Station {
                     name: "Test AM".into(),

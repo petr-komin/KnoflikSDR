@@ -93,6 +93,8 @@ pub struct Shared {
     pub hw_status: Mutex<String>,
     /// Skutečná vzorkovací frekvence vstupu = šířka panoramatu.
     pub sample_rate: AtomicU32,
+    /// Úroveň naladěného signálu v dBFS před AGC, uložená jako bity f32.
+    pub level_dbfs: AtomicU32,
     pub running: Arc<AtomicBool>,
 }
 
@@ -104,8 +106,13 @@ impl Shared {
             status: Mutex::new("startuji...".to_string()),
             hw_status: Mutex::new("hledám SoftRock...".to_string()),
             sample_rate: AtomicU32::new(96_000),
+            level_dbfs: AtomicU32::new((-120.0f32).to_bits()),
             running: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    pub fn level_dbfs(&self) -> f32 {
+        f32::from_bits(self.level_dbfs.load(Ordering::Relaxed))
     }
 }
 
@@ -278,6 +285,9 @@ fn run(device: &str, shared: &Arc<Shared>, audio_tx: &mut rtrb::Producer<f32>) -
         // Demodulace
         audio.clear();
         rx.process(&iq, &mut audio);
+        shared
+            .level_dbfs
+            .store(rx.level_dbfs().to_bits(), Ordering::Relaxed);
         for s in &audio {
             // Když ring přeteče, vzorek zahodíme - výstup si drží tempo sám.
             let _ = audio_tx.push(s * volume);

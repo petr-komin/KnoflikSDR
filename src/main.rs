@@ -4,6 +4,7 @@
 //! režimy AM/USB/LSB a oblíbené stanice.
 
 mod audio;
+mod bandplan;
 mod dsp;
 mod radio;
 mod settings;
@@ -34,6 +35,8 @@ const DC_GUARD_HZ: f64 = 2_000.0;
 const PARK_OFFSET_HZ: f64 = 10_000.0;
 /// Jak dlouho počkat po skoku, než se panorama ustálí a dá se v něm hledat.
 const SNAP_DELAY_MS: u64 = 400;
+/// Nejvyšší přiblížení panoramatu. Nad tím už je vidět jen rozmazaný jeden bin.
+const MAX_ZOOM: f32 = 32.0;
 
 fn main() -> eframe::Result {
     let shared = Arc::new(Shared::new());
@@ -195,6 +198,44 @@ impl App {
         let _ = self.tuner.send(self.set.vfo_khz * 1000.0);
     }
 
+    /// Viditelný výřez panoramatu jako (střed v Hz od VFO, šířka v Hz).
+    ///
+    /// Výřez sleduje naladěnou stanici, ale nikdy nevyjede ze zachyceného
+    /// spektra - u kraje se prostě zastaví.
+    fn view(&self, span_hz: f64) -> (f64, f64) {
+        view_window(self.set.zoom, self.set.offset_hz, span_hz)
+    }
+
+    fn set_zoom(&mut self, z: f32) {
+        self.set.zoom = z.clamp(1.0, MAX_ZOOM);
+    }
+
+    /// Krok ladění kolečkem/šipkami podle režimu. U SSB je potřeba jemnější
+    /// krok než u AM, kde stanice sedí na celých kHz.
+    fn tune_step_hz(&self) -> f64 {
+        if self.set.mode.is_ssb() {
+            100.0
+        } else {
+            1_000.0
+        }
+    }
+
+    /// Doladí o `delta_hz`. Když by se stanice dostala ke kraji okna,
+    /// posune se za ní VFO - jinak by ladění narazilo na neviditelnou zeď.
+    fn tune_by(&mut self, delta_hz: f64, span_hz: f64) {
+        let mut off = self.set.offset_hz + delta_hz;
+        let limit = span_hz * 0.45;
+        if off.abs() > limit {
+            // Okno posuneme tak, aby stanice skončila v jeho čtvrtině,
+            // a offset o stejnou hodnotu srovnáme - frekvence se nehne.
+            let shift_khz = (off - off.signum() * span_hz * 0.25) / 1000.0;
+            let before = self.set.vfo_khz;
+            self.set_vfo(self.set.vfo_khz + shift_khz);
+            off -= (self.set.vfo_khz - before) * 1000.0;
+        }
+        self.set.offset_hz = off;
+    }
+
     /// Krok VFO. Okno se posune do strany, ale zůstaneme naladění na stejné
     /// stanici - jinak by každý krok naladění shodil.
     fn step_vfo(&mut self, delta_khz: f64, span_hz: f64) {
@@ -254,6 +295,40 @@ impl App {
         c.swap_iq = self.set.swap_iq;
         c.bandwidth_hz = self.bandwidth_hz();
         c.mode = self.set.mode;
+    }
+
+    /// S-metr: úroveň naladěného signálu před AGC.
+    ///
+    /// Ukazuje dBFS, ne S-jednotky - přijímač nemá absolutní kalibraci,
+    /// takže by S-čísla byla vymyšlená.
+    fn s_meter(&self, ui: &mut egui::Ui) {
+        const LO: f32 = -100.0;
+        const HI: f32 = -10.0;
+        let db = self.shared.level_dbfs().clamp(LO, HI);
+        let t = (db - LO) / (HI - LO);
+
+        let (resp, painter) =
+            ui.allocate_painter(egui::vec2(90.0, 14.0), egui::Sense::hover());
+        let r = resp.rect;
+        painter.rect_filled(r, 2.0, egui::Color32::from_gray(30));
+        let filled = egui::Rect::from_min_size(r.min, egui::vec2(r.width() * t, r.height()));
+        // Zelená -> žlutá -> červená podle síly.
+        let col = if t < 0.6 {
+            egui::Color32::from_rgb(80, 200, 90)
+        } else if t < 0.85 {
+            egui::Color32::from_rgb(220, 200, 60)
+        } else {
+            egui::Color32::from_rgb(230, 90, 60)
+        };
+        painter.rect_filled(filled, 2.0, col);
+        painter.text(
+            r.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{db:.0} dBFS"),
+            egui::FontId::proportional(10.0),
+            egui::Color32::WHITE,
+        );
+        resp.on_hover_text("úroveň naladěného signálu před AGC");
     }
 
     /// Levý panel s oblíbenými stanicemi - jedno kliknutí = naladěno.
@@ -420,8 +495,25 @@ impl App {
         /// Jak blízko k hraně se musí trefit, aby se táhla.
         const GRAB_PX: f32 = 6.0;
 
-        let hz_of_x = |x: f32| ((x - rect.center().x) / rect.width()) as f64 * span_hz;
-        let x_of_hz = |hz: f64| rect.center().x + (hz / span_hz) as f32 * rect.width();
+        let (view_c, view_w) = self.view(span_hz);
+        let hz_of_x = |x: f32| view_c + ((x - rect.center().x) / rect.width()) as f64 * view_w;
+        let x_of_hz = |hz: f64| rect.center().x + ((hz - view_c) / view_w) as f32 * rect.width();
+
+        // Kolečko ladí, s Ctrl přibližuje, se Shiftem ladí po desetinásobcích.
+        if resp.hovered() {
+            let (scroll, shift, ctrl) =
+                ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.shift, i.modifiers.ctrl));
+            if scroll.abs() > 0.5 {
+                if ctrl {
+                    let f = if scroll > 0.0 { 1.25 } else { 1.0 / 1.25 };
+                    self.set_zoom(self.set.zoom * f);
+                } else {
+                    let mult = if shift { 10.0 } else { 1.0 };
+                    let dir = scroll.signum() as f64;
+                    self.tune_by(dir * self.tune_step_hz() * mult, span_hz);
+                }
+            }
+        }
 
         let edges = self.draggable_edges();
         let near_edge =
@@ -474,6 +566,17 @@ impl App {
             self.wf_pixels[p + 3] = 255;
         }
     }
+}
+
+/// Viditelný výřez panoramatu: (střed v Hz od VFO, šířka v Hz).
+///
+/// Výřez se drží naladěné stanice, ale zastaví se u kraje zachyceného
+/// spektra - za ním nejsou data, tak nemá smysl tam koukat.
+fn view_window(zoom: f32, offset_hz: f64, span_hz: f64) -> (f64, f64) {
+    let zoom = zoom.clamp(1.0, MAX_ZOOM) as f64;
+    let vis = span_hz / zoom;
+    let limit = (span_hz - vis) / 2.0;
+    (offset_hz.clamp(-limit, limit), vis)
 }
 
 /// Nový offset po kroku VFO tak, aby naladění zůstalo na stejné absolutní
@@ -574,6 +677,25 @@ impl eframe::App for App {
         // Šířka panoramatu = skutečná vzorkovačka, kterou capture vyjednal.
         let span_hz = self.shared.sample_rate.load(Ordering::Relaxed) as f64;
 
+        // Ladění šipkami. Jen když se needituje text, ať se nekradly klávesy
+        // z políčka pro VFO.
+        if !ctx.egui_wants_keyboard_input() {
+            let (left, right, shift) = ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowLeft),
+                    i.key_pressed(egui::Key::ArrowRight),
+                    i.modifiers.shift,
+                )
+            });
+            let mult = if shift { 10.0 } else { 1.0 };
+            if left {
+                self.tune_by(-self.tune_step_hz() * mult, span_hz);
+            }
+            if right {
+                self.tune_by(self.tune_step_hz() * mult, span_hz);
+            }
+        }
+
         // Po skoku za roh počkáme, až se panorama ustálí, a doladíme.
         if self.snap_at.is_some_and(|t| std::time::Instant::now() >= t) {
             self.snap_at = None;
@@ -628,10 +750,20 @@ impl eframe::App for App {
                         .size(18.0)
                         .strong(),
                 );
+                // V jakém úseku pásma zrovna jsme.
+                if let Some(s) = bandplan::at(tuned_khz) {
+                    let (r, g, b) = s.usage.color();
+                    ui.label(
+                        egui::RichText::new(format!("{} · {}", s.band, s.usage.label()))
+                            .color(egui::Color32::from_rgb(r, g, b)),
+                    );
+                }
                 ui.separator();
                 for m in [dsp::Mode::Am, dsp::Mode::Usb, dsp::Mode::Lsb] {
                     ui.selectable_value(&mut self.set.mode, m, m.label());
                 }
+                ui.separator();
+                self.s_meter(ui);
                 ui.separator();
                 if ui
                     .button("⌖ nejsilnější")
@@ -647,6 +779,8 @@ impl eframe::App for App {
                 ui.add(egui::Slider::new(&mut self.set.volume, 0.0..=1.0).show_value(false));
                 ui.separator();
                 ui.checkbox(&mut self.set.swap_iq, "prohodit I/Q");
+                ui.checkbox(&mut self.set.show_bandplan, "bandplan")
+                    .on_hover_text("podbarvení úseků pásem (IARU R1)");
                 ui.separator();
                 let (bw_min, bw_max) = radio::bandwidth_range(self.set.mode);
                 let mut bw_khz = self.bandwidth_hz() / 1000.0;
@@ -659,6 +793,22 @@ impl eframe::App for App {
                     .changed()
                 {
                     self.set_bandwidth_hz(bw_khz * 1000.0);
+                }
+                ui.separator();
+                ui.label("zoom:");
+                if ui.button("−").clicked() {
+                    self.set_zoom(self.set.zoom / 2.0);
+                }
+                ui.label(format!("{:.0}×", self.set.zoom));
+                if ui.button("+").clicked() {
+                    self.set_zoom(self.set.zoom * 2.0);
+                }
+                if ui
+                    .button("celé")
+                    .on_hover_text("oddálit na celou vzorkovačku (nebo Ctrl+kolečko)")
+                    .clicked()
+                {
+                    self.set_zoom(1.0);
                 }
                 ui.separator();
                 ui.label("dB rozsah:");
@@ -685,9 +835,11 @@ impl eframe::App for App {
             let full = ui.available_rect_before_wrap();
             let spec_h = full.height() * 0.35;
 
-            // Převod frekvenčního offsetu na x a zpět - společné pro obě plochy.
+            // Viditelný výřez; při zoomu 1 je to celá vzorkovačka.
+            let (view_c, view_w) = self.view(span_hz);
+            // Převod frekvenčního offsetu na x - společné pro všechny plochy.
             let x_of = |rect: &egui::Rect, hz: f64| -> f32 {
-                rect.center().x + (hz / span_hz) as f32 * rect.width()
+                rect.center().x + ((hz - view_c) / view_w) as f32 * rect.width()
             };
             let (band_lo, band_hi) = self.band_edges();
 
@@ -698,6 +850,38 @@ impl eframe::App for App {
             );
             let rect = resp.rect;
             painter.rect_filled(rect, 0.0, egui::Color32::from_gray(16));
+
+            // Bandplan: podbarvení úseků podle druhu provozu. Kreslí se jako
+            // první, ať je pod mřížkou i signálem.
+            if self.set.show_bandplan {
+                let lo_khz = self.set.vfo_khz + (view_c - view_w / 2.0) / 1000.0;
+                let hi_khz = self.set.vfo_khz + (view_c + view_w / 2.0) / 1000.0;
+                for s in bandplan::overlapping(lo_khz, hi_khz) {
+                    let x0 = x_of(&rect, (s.from_khz - self.set.vfo_khz) * 1000.0)
+                        .max(rect.left());
+                    let x1 =
+                        x_of(&rect, (s.to_khz - self.set.vfo_khz) * 1000.0).min(rect.right());
+                    if x1 <= x0 {
+                        continue;
+                    }
+                    let (r, g, b) = s.usage.color();
+                    painter.rect_filled(
+                        egui::Rect::from_x_y_ranges(x0..=x1, rect.y_range()),
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(r, g, b, 28),
+                    );
+                    // Popisek jen když je na něj místo.
+                    if x1 - x0 > 40.0 {
+                        painter.text(
+                            egui::pos2((x0 + x1) / 2.0, rect.top() + 1.0),
+                            egui::Align2::CENTER_TOP,
+                            format!("{} {}", s.band, s.usage.label()),
+                            egui::FontId::proportional(9.0),
+                            egui::Color32::from_rgba_unmultiplied(r, g, b, 200),
+                        );
+                    }
+                }
+            }
 
             // Vodorovná mřížka po dB
             let db_step = nice_db_step(self.set.db_max - self.set.db_min);
@@ -720,14 +904,15 @@ impl eframe::App for App {
                 db += db_step;
             }
 
-            // Svislá mřížka po kHz, popisky v absolutní frekvenci
-            let khz_step = nice_khz_step(span_hz / 1000.0);
-            let half_khz = span_hz / 2000.0;
-            let mut k = -(half_khz / khz_step).floor() * khz_step;
+            // Svislá mřížka po kHz, popisky v absolutní frekvenci.
+            // Krok se počítá z viditelné šířky, ať mřížka při zoomu zhoustne.
+            let khz_step = nice_khz_step(view_w / 1000.0);
+            let lo_khz = (view_c - view_w / 2.0) / 1000.0;
+            let hi_khz = (view_c + view_w / 2.0) / 1000.0;
+            let mut k = (lo_khz / khz_step).ceil() * khz_step;
             let mut grid_lines: Vec<(f32, f64)> = Vec::new();
-            while k <= half_khz {
-                let x = x_of(&rect, k * 1000.0);
-                grid_lines.push((x, self.set.vfo_khz + k));
+            while k <= hi_khz {
+                grid_lines.push((x_of(&rect, k * 1000.0), self.set.vfo_khz + k));
                 k += khz_step;
             }
             // Jen čáry; čísla jdou do vlastního pruhu pod spektrem, jinak by
@@ -750,15 +935,19 @@ impl eframe::App for App {
                 egui::Color32::from_rgba_unmultiplied(90, 160, 255, 40),
             );
 
+            // Kreslíme jen biny uvnitř výřezu - jinak by se při zoomu počítaly
+            // tisíce bodů mimo obrazovku.
             let n = bins.len().max(2);
-            let pts: Vec<egui::Pos2> = bins
-                .iter()
-                .enumerate()
-                .map(|(i, &db)| {
-                    let x = rect.left() + rect.width() * i as f32 / (n - 1) as f32;
-                    let t = ((db - self.set.db_min) / (self.set.db_max - self.set.db_min)).clamp(0.0, 1.0);
-                    let y = rect.bottom() - rect.height() * t;
-                    egui::pos2(x, y)
+            let idx_of_hz = |hz: f64| ((hz / span_hz + 0.5) * n as f64).round() as isize;
+            let i0 = idx_of_hz(view_c - view_w / 2.0).clamp(0, n as isize - 1) as usize;
+            let i1 = idx_of_hz(view_c + view_w / 2.0).clamp(0, n as isize - 1) as usize;
+            let pts: Vec<egui::Pos2> = (i0..=i1)
+                .map(|i| {
+                    let hz = (i as f64 / n as f64 - 0.5) * span_hz;
+                    let db = bins[i];
+                    let t = ((db - self.set.db_min) / (self.set.db_max - self.set.db_min))
+                        .clamp(0.0, 1.0);
+                    egui::pos2(x_of(&rect, hz), rect.bottom() - rect.height() * t)
                 })
                 .collect();
             painter.add(egui::Shape::line(
@@ -843,8 +1032,15 @@ impl eframe::App for App {
                 }
             }
             if let Some(tex) = &self.wf_tex {
+                // Zoom vodopádu = výřez z textury přes UV, historie zůstane.
+                let u0 = ((view_c - view_w / 2.0) / span_hz + 0.5) as f32;
+                let u1 = ((view_c + view_w / 2.0) / span_hz + 0.5) as f32;
                 let wf_resp = ui.add(
                     egui::Image::new(tex)
+                        .uv(egui::Rect::from_min_max(
+                            egui::pos2(u0, 0.0),
+                            egui::pos2(u1, 1.0),
+                        ))
                         .fit_to_exact_size(egui::vec2(full.width(), full.bottom() - ar.bottom()))
                         .sense(egui::Sense::click_and_drag()),
                 );
@@ -928,6 +1124,37 @@ mod tests {
             bins[idx] = db;
         }
         bins
+    }
+
+    #[test]
+    fn zoom_1_ukazuje_cele_spektrum() {
+        let (c, w) = view_window(1.0, 0.0, SPAN);
+        assert_eq!(w, SPAN);
+        assert_eq!(c, 0.0, "při zoomu 1 nemá být kam posouvat");
+    }
+
+    #[test]
+    fn zoom_zuzuje_vyrez_a_sleduje_ladeni() {
+        let (c, w) = view_window(4.0, 10_000.0, SPAN);
+        assert_eq!(w, SPAN / 4.0);
+        assert_eq!(c, 10_000.0, "výřez se má vycentrovat na naladěnou stanici");
+    }
+
+    /// Výřez nesmí ukazovat mimo zachycené spektrum - tam nejsou data.
+    #[test]
+    fn vyrez_nevyjede_ze_spektra() {
+        for zoom in [1.0, 2.0, 4.0, 8.0, 32.0] {
+            for off in [-48_000.0, -40_000.0, 0.0, 40_000.0, 48_000.0] {
+                let (c, w) = view_window(zoom, off, SPAN);
+                assert!(
+                    c - w / 2.0 >= -SPAN / 2.0 - 1e-6 && c + w / 2.0 <= SPAN / 2.0 + 1e-6,
+                    "zoom {zoom}, offset {off}: výřez {}..{} je mimo +-{}",
+                    c - w / 2.0,
+                    c + w / 2.0,
+                    SPAN / 2.0
+                );
+            }
+        }
     }
 
     /// Jádro chování: krok VFO posune okno, ale naladěná absolutní

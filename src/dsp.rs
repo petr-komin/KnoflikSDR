@@ -216,6 +216,11 @@ impl Agc {
         }
     }
 
+    /// Obálka signálu před regulací - přesně to, co má ukazovat S-metr.
+    pub fn envelope(&self) -> f32 {
+        self.env
+    }
+
     #[inline]
     pub fn push(&mut self, x: f32) -> f32 {
         let a = x.abs();
@@ -278,6 +283,11 @@ impl Demod {
             self.mode = mode;
             self.refresh_taps();
         }
+    }
+
+    /// Úroveň naladěného signálu v dBFS (před AGC). Pro S-metr.
+    pub fn level_dbfs(&self) -> f32 {
+        20.0 * self.agc.envelope().max(1e-9).log10()
     }
 
     fn refresh_taps(&mut self) {
