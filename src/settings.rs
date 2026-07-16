@@ -5,6 +5,7 @@
 
 use crate::dsp::Mode;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,15 @@ const SAVE_DELAY: Duration = Duration::from_millis(800);
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Station {
     pub name: String,
+    pub freq_khz: f64,
+    pub mode: Mode,
+    pub bandwidth_hz: f64,
+}
+
+/// Kde jsme naposled byli na daném pásmu. Obdoba band-stacking registrů
+/// v transceiverech - tlačítko pásma vrátí přesně to místo.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub struct BandMemory {
     pub freq_khz: f64,
     pub mode: Mode,
     pub bandwidth_hz: f64,
@@ -42,6 +52,9 @@ pub struct Settings {
     /// Podbarvovat úseky pásem podle bandplanu?
     pub show_bandplan: bool,
     pub stations: Vec<Station>,
+    /// Poslední místo na každém pásmu, klíčem je název z bandplanu.
+    /// BTreeMap kvůli stabilnímu pořadí v souboru.
+    pub band_memory: BTreeMap<String, BandMemory>,
 }
 
 impl Default for Settings {
@@ -61,6 +74,7 @@ impl Default for Settings {
             zoom: 1.0,
             show_bandplan: true,
             stations: Vec::new(),
+            band_memory: BTreeMap::new(),
         }
     }
 }
@@ -239,6 +253,7 @@ mod tests {
             window_h: 800.0,
             zoom: 4.0,
             show_bandplan: false,
+            band_memory: BTreeMap::new(),
             stations: vec![
                 Station {
                     name: "Test AM".into(),
@@ -307,6 +322,39 @@ mod tests {
         let base = tmp_base("prazdno");
         assert_eq!(Settings::load_from(&base), Settings::default());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Paměť pásem musí přežít zápis a načtení, jinak by tlačítko pásma
+    /// po restartu zapomnělo, kde jsi byl.
+    #[test]
+    fn pamet_pasem_prezije_ulozeni() {
+        let mut s = Settings::default();
+        s.band_memory.insert(
+            "41 m".into(),
+            BandMemory {
+                freq_khz: 7300.0,
+                mode: Mode::Am,
+                bandwidth_hz: 8000.0,
+            },
+        );
+        s.band_memory.insert(
+            "20 m".into(),
+            BandMemory {
+                freq_khz: 14200.0,
+                mode: Mode::Usb,
+                bandwidth_hz: 2700.0,
+            },
+        );
+        let back: Settings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
+        assert_eq!(back.band_memory.len(), 2);
+        assert_eq!(back.band_memory["20 m"].mode, Mode::Usb);
+        assert_eq!(back.band_memory["41 m"].freq_khz, 7300.0);
+    }
+
+    #[test]
+    fn config_bez_pameti_pasem_nespadne() {
+        let s: Settings = toml::from_str("vfo_khz = 7300.0").unwrap();
+        assert!(s.band_memory.is_empty());
     }
 
     #[test]

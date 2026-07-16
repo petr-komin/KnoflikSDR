@@ -210,13 +210,13 @@ impl App {
         self.set.zoom = z.clamp(1.0, MAX_ZOOM);
     }
 
-    /// Krok ladění kolečkem/šipkami podle režimu. U SSB je potřeba jemnější
-    /// krok než u AM, kde stanice sedí na celých kHz.
+    /// Krok jemného ladění kolečkem a šipkami. Na hrubé skoky je Shift
+    /// (desetinásobek) a tlačítka VFO.
     fn tune_step_hz(&self) -> f64 {
         if self.set.mode.is_ssb() {
-            100.0
+            10.0
         } else {
-            1_000.0
+            100.0
         }
     }
 
@@ -255,14 +255,59 @@ impl App {
             Some(std::time::Instant::now() + std::time::Duration::from_millis(SNAP_DELAY_MS));
     }
 
+    /// Zapamatuje si aktuální místo pro pásmo, na kterém zrovna jsme.
+    /// Volá se průběžně, takže tlačítko pásma pak vrátí přesně sem.
+    fn remember_band(&mut self) {
+        let f = self.tuned_khz();
+        if let Some(s) = bandplan::at(f) {
+            self.set.band_memory.insert(
+                s.band.to_string(),
+                settings::BandMemory {
+                    freq_khz: f,
+                    mode: self.set.mode,
+                    bandwidth_hz: self.bandwidth_hz(),
+                },
+            );
+        }
+    }
+
+    /// Skok na pásmo: kam jsme se na něm naposled dostali, jinak doprostřed.
+    fn goto_band(&mut self, band: &bandplan::Band) {
+        if let Some(m) = self.set.band_memory.get(band.name).copied() {
+            self.tune_to(m.freq_khz, m.mode, m.bandwidth_hz);
+            return;
+        }
+        // Poprvé na tomhle pásmu: doprostřed a s obvyklým režimem.
+        // Rozhlas je AM, amatérská pásma pod 10 MHz LSB, nad ním USB.
+        let mode = if band.is_broadcast() {
+            dsp::Mode::Am
+        } else if band.from_khz < 10_000.0 {
+            dsp::Mode::Lsb
+        } else {
+            dsp::Mode::Usb
+        };
+        let bw = if mode.is_ssb() {
+            radio::SSB_BANDWIDTH_HZ
+        } else {
+            radio::AM_BANDWIDTH_HZ
+        };
+        self.tune_to(band.middle_khz(), mode, bw);
+    }
+
+    /// Naladí konkrétní frekvenci i s režimem a šířkou. VFO se posadí tak,
+    /// aby stanice padla mimo mrtvou zónu kolem DC.
+    fn tune_to(&mut self, freq_khz: f64, mode: dsp::Mode, bandwidth_hz: f64) {
+        self.set.mode = mode;
+        self.set_bandwidth_hz(bandwidth_hz);
+        self.set_vfo(freq_khz - PARK_OFFSET_HZ / 1000.0);
+        self.set.offset_hz = PARK_OFFSET_HZ;
+        self.snap_at = None; // ruční volba má přednost před hledáním
+    }
+
     /// Naladí oblíbenou stanici i s jejím režimem a šířkou pásma.
     /// VFO se posadí tak, aby stanice padla mimo mrtvou zónu kolem DC.
     fn tune_station(&mut self, st: &Station) {
-        self.set.mode = st.mode;
-        self.set_bandwidth_hz(st.bandwidth_hz);
-        self.set_vfo(st.freq_khz - PARK_OFFSET_HZ / 1000.0);
-        self.set.offset_hz = PARK_OFFSET_HZ;
-        self.snap_at = None; // ruční volba má přednost před hledáním
+        self.tune_to(st.freq_khz, st.mode, st.bandwidth_hz);
     }
 
     fn tuned_khz(&self) -> f64 {
@@ -295,6 +340,46 @@ impl App {
         c.swap_iq = self.set.swap_iq;
         c.bandwidth_hz = self.bandwidth_hz();
         c.mode = self.set.mode;
+    }
+
+    /// Řada tlačítek pásem. Barva odpovídá bandplanu, takže rozhlasová
+    /// pásma jsou na první pohled poznat.
+    fn band_buttons(&mut self, ui: &mut egui::Ui, tuned_khz: f64) {
+        let bands = bandplan::bands();
+        let here = bandplan::at(tuned_khz).map(|s| s.band);
+        let mut go: Option<bandplan::Band> = None;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("pásma:");
+            for b in &bands {
+                let active = here == Some(b.name);
+                let known = self.set.band_memory.contains_key(b.name);
+                let (r, g, bl) = if b.is_broadcast() {
+                    bandplan::Usage::Broadcast.color()
+                } else {
+                    bandplan::Usage::Phone.color()
+                };
+                let mut text = egui::RichText::new(b.name)
+                    .color(egui::Color32::from_rgb(r, g, bl));
+                if active {
+                    text = text.strong();
+                }
+                let tip = if known {
+                    format!("zpět tam, kde jsi na {} naposled byl", b.name)
+                } else {
+                    format!("{} - doprostřed ({:.0} kHz)", b.name, b.middle_khz())
+                };
+                if ui.selectable_label(active, text).on_hover_text(tip).clicked() {
+                    go = Some(*b);
+                }
+            }
+        });
+
+        if let Some(b) = go {
+            // Než odskočíme, uložíme si, kde jsme na stávajícím pásmu byli.
+            self.remember_band();
+            self.goto_band(&b);
+        }
     }
 
     /// S-metr: úroveň naladěného signálu před AGC.
@@ -500,17 +585,29 @@ impl App {
         let x_of_hz = |hz: f64| rect.center().x + ((hz - view_c) / view_w) as f32 * rect.width();
 
         // Kolečko ladí, s Ctrl přibližuje, se Shiftem ladí po desetinásobcích.
+        //
+        // Počítáme diskrétní cvaknutí z událostí, ne smooth_scroll_delta -
+        // ta je vyhlazená a doznívá přes několik snímků, takže by jedno
+        // cvaknutí naladilo o několik kroků najednou.
         if resp.hovered() {
-            let (scroll, shift, ctrl) =
-                ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.shift, i.modifiers.ctrl));
-            if scroll.abs() > 0.5 {
+            let (notches, shift, ctrl) = ui.input(|i| {
+                let n: i32 = i
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::MouseWheel { delta, .. } if delta.y > 0.0 => Some(1),
+                        egui::Event::MouseWheel { delta, .. } if delta.y < 0.0 => Some(-1),
+                        _ => None,
+                    })
+                    .sum();
+                (n, i.modifiers.shift, i.modifiers.ctrl)
+            });
+            if notches != 0 {
                 if ctrl {
-                    let f = if scroll > 0.0 { 1.25 } else { 1.0 / 1.25 };
-                    self.set_zoom(self.set.zoom * f);
+                    self.set_zoom(self.set.zoom * 1.25f32.powi(notches));
                 } else {
                     let mult = if shift { 10.0 } else { 1.0 };
-                    let dir = scroll.signum() as f64;
-                    self.tune_by(dir * self.tune_step_hz() * mult, span_hz);
+                    self.tune_by(notches as f64 * self.tune_step_hz() * mult, span_hz);
                 }
             }
         }
@@ -815,6 +912,8 @@ impl eframe::App for App {
                 ui.add(egui::Slider::new(&mut self.set.db_min, -140.0..=-40.0).text("min"));
                 ui.add(egui::Slider::new(&mut self.set.db_max, -60.0..=0.0).text("max"));
             });
+            ui.add_space(2.0);
+            self.band_buttons(ui, tuned_khz);
             ui.add_space(4.0);
         });
 
@@ -868,16 +967,18 @@ impl eframe::App for App {
                     painter.rect_filled(
                         egui::Rect::from_x_y_ranges(x0..=x1, rect.y_range()),
                         0.0,
-                        egui::Color32::from_rgba_unmultiplied(r, g, b, 28),
+                        egui::Color32::from_rgba_unmultiplied(r, g, b, s.usage.fill_alpha()),
                     );
-                    // Popisek jen když je na něj místo.
-                    if x1 - x0 > 40.0 {
+                    // Popisek u levého kraje úseku, ne doprostřed: široký
+                    // úsek má střed přesně tam, kde je ryska VFO, a lezlo
+                    // by to jedno přes druhé.
+                    if x1 - x0 > 50.0 {
                         painter.text(
-                            egui::pos2((x0 + x1) / 2.0, rect.top() + 1.0),
-                            egui::Align2::CENTER_TOP,
+                            egui::pos2(x0 + 4.0, rect.top() + 2.0),
+                            egui::Align2::LEFT_TOP,
                             format!("{} {}", s.band, s.usage.label()),
-                            egui::FontId::proportional(9.0),
-                            egui::Color32::from_rgba_unmultiplied(r, g, b, 200),
+                            egui::FontId::proportional(12.0),
+                            egui::Color32::from_rgba_unmultiplied(r, g, b, 230),
                         );
                     }
                 }
@@ -973,11 +1074,12 @@ impl eframe::App for App {
                 ],
                 egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 170, 40)),
             );
+            // Popisek VFO je níž, ať se nepere s popisky pásem u horní hrany.
             painter.text(
-                egui::pos2(x_of(&rect, 0.0) + 3.0, rect.top() + 2.0),
+                egui::pos2(x_of(&rect, 0.0) + 3.0, rect.top() + 18.0),
                 egui::Align2::LEFT_TOP,
                 "VFO",
-                egui::FontId::proportional(10.0),
+                egui::FontId::proportional(11.0),
                 egui::Color32::from_rgb(255, 170, 40),
             );
 
@@ -1098,6 +1200,10 @@ impl eframe::App for App {
             self.set.window_w = size.x;
             self.set.window_h = size.y;
         }
+
+        // Průběžně si pamatujeme, kde na pásmu zrovna jsme, ať se tam
+        // tlačítko pásma umí vrátit i po restartu.
+        self.remember_band();
 
         self.push_controls();
         self.autosave.tick(self.set.clone());

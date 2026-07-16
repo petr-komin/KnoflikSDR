@@ -26,13 +26,27 @@ impl Usage {
     }
 
     /// (r, g, b) - průhlednost si řeší vykreslování.
+    ///
+    /// Odstíny jsou vybrané tak, aby se nepraly s ostatní grafikou:
+    /// oranžová patří mrtvé zóně kolem VFO, červená značce ladění,
+    /// modrá propustnému pásmu a zelená křivce spektra.
     pub fn color(&self) -> (u8, u8, u8) {
         match self {
             Usage::Cw => (90, 150, 230),
             Usage::Digital => (200, 120, 220),
             Usage::Phone => (90, 200, 120),
             Usage::Beacon => (230, 180, 70),
-            Usage::Broadcast => (230, 130, 90),
+            // Tyrkysová: rozhlas byl původně oranžový a splýval s mrtvou
+            // zónou kolem VFO, která je taky oranžová.
+            Usage::Broadcast => (70, 210, 205),
+        }
+    }
+
+    /// Rozhlas je pro poslech to hlavní, tak ať je vidět víc než ostatní.
+    pub fn fill_alpha(&self) -> u8 {
+        match self {
+            Usage::Broadcast => 45,
+            _ => 26,
         }
     }
 }
@@ -115,6 +129,45 @@ pub const SEGMENTS: &[Segment] = &[
     seg(28225.0, 29700.0, Usage::Phone, "10 m"),
 ];
 
+/// Celé pásmo poskládané ze svých úseků.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Band {
+    pub name: &'static str,
+    pub from_khz: f64,
+    pub to_khz: f64,
+}
+
+impl Band {
+    pub fn middle_khz(&self) -> f64 {
+        (self.from_khz + self.to_khz) / 2.0
+    }
+
+    /// Je to rozhlasové pásmo? Pak se na něj skáče v AM.
+    pub fn is_broadcast(&self) -> bool {
+        overlapping(self.from_khz, self.to_khz).any(|s| s.usage == Usage::Broadcast)
+    }
+}
+
+/// Seznam pásem seřazený podle frekvence, odvozený z úseků.
+pub fn bands() -> Vec<Band> {
+    let mut out: Vec<Band> = Vec::new();
+    for s in SEGMENTS {
+        match out.iter_mut().find(|b| b.name == s.band) {
+            Some(b) => {
+                b.from_khz = b.from_khz.min(s.from_khz);
+                b.to_khz = b.to_khz.max(s.to_khz);
+            }
+            None => out.push(Band {
+                name: s.band,
+                from_khz: s.from_khz,
+                to_khz: s.to_khz,
+            }),
+        }
+    }
+    out.sort_by(|a, b| a.from_khz.partial_cmp(&b.from_khz).unwrap());
+    out
+}
+
 /// Úseky, které zasahují do rozsahu `from_khz`..`to_khz`.
 pub fn overlapping(from_khz: f64, to_khz: f64) -> impl Iterator<Item = &'static Segment> {
     SEGMENTS
@@ -162,6 +215,33 @@ mod tests {
     #[test]
     fn mimo_pasma_nic() {
         assert!(at(6800.0).is_none(), "6800 kHz není v žádném úseku");
+    }
+
+    #[test]
+    fn pasma_jsou_serazena_a_nesplyvaji() {
+        let b = bands();
+        assert!(b.len() > 10, "málo pásem: {}", b.len());
+        for w in b.windows(2) {
+            assert!(
+                w[0].from_khz <= w[1].from_khz,
+                "{} není před {}",
+                w[0].name,
+                w[1].name
+            );
+        }
+        // 40 m musí pokrýt celý svůj rozsah, ne jen první úsek.
+        let m40 = b.iter().find(|x| x.name == "40 m").unwrap();
+        assert_eq!(m40.from_khz, 7000.0);
+        assert_eq!(m40.to_khz, 7200.0);
+    }
+
+    #[test]
+    fn rozhlasova_pasma_jsou_poznat() {
+        let b = bands();
+        let m41 = b.iter().find(|x| x.name == "41 m").unwrap();
+        assert!(m41.is_broadcast(), "41 m je rozhlasové");
+        let m40 = b.iter().find(|x| x.name == "40 m").unwrap();
+        assert!(!m40.is_broadcast(), "40 m je amatérské");
     }
 
     #[test]
