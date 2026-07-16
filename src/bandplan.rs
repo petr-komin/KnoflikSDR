@@ -72,6 +72,10 @@ const fn seg(from_khz: f64, to_khz: f64, usage: Usage, band: &'static str) -> Se
 /// Amatérská pásma a hlavní rozhlasové úseky na KV.
 /// Řazeno vzestupně podle frekvence.
 pub const SEGMENTS: &[Segment] = &[
+    // 120 m rozhlas (tropické pásmo)
+    seg(2300.0, 2495.0, Usage::Broadcast, "120 m"),
+    // 90 m rozhlas (tropické pásmo)
+    seg(3200.0, 3400.0, Usage::Broadcast, "90 m"),
     // 160 m
     seg(1810.0, 1838.0, Usage::Cw, "160 m"),
     seg(1838.0, 1843.0, Usage::Digital, "160 m"),
@@ -80,6 +84,11 @@ pub const SEGMENTS: &[Segment] = &[
     seg(3500.0, 3570.0, Usage::Cw, "80 m"),
     seg(3570.0, 3600.0, Usage::Digital, "80 m"),
     seg(3600.0, 3800.0, Usage::Phone, "80 m"),
+    // 75 m rozhlas
+    seg(3900.0, 4000.0, Usage::Broadcast, "75 m"),
+    // 60 m rozhlas (tropické pásmo). Jmenuje se schválně jinak než
+    // amatérské 60 m, jinak by se obě slepila do jednoho pásma.
+    seg(4750.0, 4995.0, Usage::Broadcast, "60 m T"),
     // 49 m rozhlas
     seg(5900.0, 6200.0, Usage::Broadcast, "49 m"),
     // 60 m
@@ -98,6 +107,8 @@ pub const SEGMENTS: &[Segment] = &[
     seg(10130.0, 10150.0, Usage::Digital, "30 m"),
     // 25 m rozhlas
     seg(11600.0, 12100.0, Usage::Broadcast, "25 m"),
+    // 22 m rozhlas
+    seg(13570.0, 13870.0, Usage::Broadcast, "22 m"),
     // 20 m
     seg(14000.0, 14070.0, Usage::Cw, "20 m"),
     seg(14070.0, 14099.0, Usage::Digital, "20 m"),
@@ -105,6 +116,8 @@ pub const SEGMENTS: &[Segment] = &[
     seg(14101.0, 14350.0, Usage::Phone, "20 m"),
     // 19 m rozhlas
     seg(15100.0, 15800.0, Usage::Broadcast, "19 m"),
+    // 16 m rozhlas
+    seg(17480.0, 17900.0, Usage::Broadcast, "16 m"),
     // 17 m
     seg(18068.0, 18095.0, Usage::Cw, "17 m"),
     seg(18095.0, 18109.0, Usage::Digital, "17 m"),
@@ -122,6 +135,8 @@ pub const SEGMENTS: &[Segment] = &[
     seg(24915.0, 24929.0, Usage::Digital, "12 m"),
     seg(24929.0, 24931.0, Usage::Beacon, "12 m"),
     seg(24931.0, 24990.0, Usage::Phone, "12 m"),
+    // 11 m rozhlas (dnes skoro prázdné, občas DRM)
+    seg(25670.0, 26100.0, Usage::Broadcast, "11 m"),
     // 10 m
     seg(28000.0, 28070.0, Usage::Cw, "10 m"),
     seg(28070.0, 28190.0, Usage::Digital, "10 m"),
@@ -198,6 +213,68 @@ mod tests {
                 s.to_khz
             );
         }
+    }
+
+    /// Úseky se nesmí překrývat - `at()` bere první nalezený, takže
+    /// při překryvu by tiše vyhrál ten dřív zapsaný.
+    #[test]
+    fn useky_se_neprekryvaji() {
+        for (i, a) in SEGMENTS.iter().enumerate() {
+            for b in &SEGMENTS[i + 1..] {
+                assert!(
+                    a.to_khz <= b.from_khz || b.to_khz <= a.from_khz,
+                    "překryv: {} {} ({}-{}) a {} {} ({}-{})",
+                    a.band,
+                    a.usage.label(),
+                    a.from_khz,
+                    a.to_khz,
+                    b.band,
+                    b.usage.label(),
+                    b.from_khz,
+                    b.to_khz
+                );
+            }
+        }
+    }
+
+    /// Úseky jednoho pásma musí tvořit souvislý celek.
+    ///
+    /// Kdyby dvě různá pásma dostala stejný název (třeba amatérské 60 m
+    /// a tropický rozhlas na 4750 kHz), bands() by je slepilo do jednoho
+    /// a mezi jejich úseky by zela díra. Proto se tropický rozhlas jmenuje
+    /// "60 m T".
+    #[test]
+    fn pasma_jsou_souvisla() {
+        for b in bands() {
+            let pokryto: f64 = SEGMENTS
+                .iter()
+                .filter(|s| s.band == b.name)
+                .map(|s| s.to_khz - s.from_khz)
+                .sum();
+            let rozsah = b.to_khz - b.from_khz;
+            assert!(
+                (pokryto - rozsah).abs() < 1e-6,
+                "{}: rozsah {rozsah} kHz, ale úseky pokrývají jen {pokryto} kHz \
+                 - díra uvnitř znamená, že se slepila dvě různá pásma",
+                b.name
+            );
+        }
+    }
+
+    #[test]
+    fn rozhlas_kolem_4_mhz_existuje() {
+        let s = at(3950.0).expect("75 m rozhlas na 3950 kHz");
+        assert_eq!(s.usage, Usage::Broadcast);
+        assert_eq!(s.band, "75 m");
+    }
+
+    #[test]
+    fn tropicka_pasma_existuji() {
+        assert_eq!(at(2400.0).unwrap().band, "120 m");
+        assert_eq!(at(3300.0).unwrap().band, "90 m");
+        assert_eq!(at(4800.0).unwrap().band, "60 m T");
+        // Amatérské 60 m zůstalo samostatné.
+        assert_eq!(at(5360.0).unwrap().band, "60 m");
     }
 
     #[test]
