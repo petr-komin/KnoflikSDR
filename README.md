@@ -84,5 +84,11 @@ je psaný od nuly.
 
 Funkční přijímač pro denní poslech. Vysílání není a zatím se nechystá.
 
-Průzkum k napojení SDRplay RSP1 je v [docs/sdrplay-rsp1.md](docs/sdrplay-rsp1.md) —
-přístup k hardwaru je ověřený, chybí decimace z 8 MSps a zoomovatelné panorama.
+Poznámky k dalším směrům:
+
+- [docs/raspberry-pi.md](docs/raspberry-pi.md) — provoz SoftRocku na Pi.
+  DSP zabere ~8 % jádra i9, takže by to mělo stačit; úzkým hrdlem bude spíš
+  vodopád než procesor.
+- [docs/sdrplay-rsp1.md](docs/sdrplay-rsp1.md) — napojení SDRplay RSP1.
+  Přístup k hardwaru je ověřený, chybí decimace z 8 MSps a zoomovatelné
+  panorama. Podstatně větší úloha.

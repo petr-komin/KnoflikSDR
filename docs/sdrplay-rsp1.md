@@ -2,6 +2,10 @@
 
 **Stav:** neimplementováno. Průzkum hotový 16. 7. 2026, přístup k hardwaru ověřen třemi nezávislými cestami.
 
+> Tenhle dokument je **jen o SDRplay RSP1**. Provoz SoftRocku na slabším stroji
+> (typicky Raspberry Pi) s tímhle nesouvisí a je popsaný v
+> [raspberry-pi.md](raspberry-pi.md) — je to výrazně menší úloha.
+
 Cílem tohoto dokumentu je, aby se příště nemuselo nic zjišťovat znovu. Rozlišuje **ověřeno** (pustil jsem příkaz a viděl výsledek) od **odhad** (rozmyšleno, ale nevyzkoušeno).
 
 ---
