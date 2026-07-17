@@ -12,6 +12,7 @@ categories = ["science", "multimedia::audio"]
 [dependencies]
 alsa = "0.11"
 anyhow = "1.0.103"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 # Záměrně glow (OpenGL) místo výchozího wgpu. wgpu na Linuxu chce Vulkan,
 # a když pro kartu není Vulkan ovladač, spadne do softwarového llvmpipe -
 # ten pak vykreslováním sežere klidně šest jader. OpenGL bývá funkční vždy.
@@ -29,3 +30,4 @@ rusb = "0.9.4"
 rustfft = "6.4.1"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.3"
+ureq = "3.3.0"

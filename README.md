@@ -17,6 +17,8 @@ jeden statický binár místo Pythonu s C rozšířením.
 - **Panorama a vodopád** přes celou vzorkovací frekvenci, s mřížkou v dB a kHz
 - **Ladění kliknutím** do spektra i vodopádu, tažením hran se mění šířka pásma
 - **Oblíbené stanice** — jedním klikem i s režimem a šířkou filtru
+- **Kdo to vlastně vysílá** — v AM se podle rozpisu EiBi ukáže, která stanice
+  má na naladěné frekvenci právě teď být
 - **Vyznačená mrtvá zóna** kolem VFO, kde má SoftRock DC spur
 - **Doladění na nejsilnější stanici** po skoku o celé okno
 - Nastavení se ukládá průběžně do `~/.config/knoflik-sdr/config.toml`
@@ -60,6 +62,14 @@ Krystal je potřeba zkalibrovat pro každý kus zvlášť. Hodnotu můžeš pře
 pokud jsi předtím jel na Quisku.
 
 USB práva řeší na Debianu udev pravidlo z `libhamlib4`, root potřeba není.
+
+## Rozpis stanic
+
+Sezónní rozpis KV rozhlasu se stahuje z [EiBi](http://www.eibispace.de) do
+`~/.cache/knoflik-sdr/`. Stahuje se jednou za sezónu, na pozadí — start
+aplikace na síť nečeká a bez připojení funguje všechno ostatní.
+
+Data udržuje a volně poskytuje Eike Bierwirth. Poděkování patří jemu.
 
 ## Licence
 

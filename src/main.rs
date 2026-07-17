@@ -9,6 +9,7 @@ mod decode;
 mod dsp;
 mod radio;
 mod settings;
+mod schedule;
 mod si570;
 
 use settings::{Autosave, Settings, Station};
@@ -38,6 +39,16 @@ const PARK_OFFSET_HZ: f64 = 10_000.0;
 const SNAP_DELAY_MS: u64 = 400;
 /// Nejvyšší přiblížení panoramatu. Nad tím už je vidět jen rozmazaný jeden bin.
 const MAX_ZOOM: f32 = 32.0;
+/// Jak daleko od naladěné frekvence hledat v rozpisu. Pokrývá nepřesnost
+/// ladění i to, že se stanice od rozpisu občas o kousek liší.
+const SCHEDULE_TOLERANCE_KHZ: f64 = 2.0;
+
+/// Stav načítání rozpisu EiBi.
+enum ScheduleState {
+    Loading,
+    Ready(schedule::Schedule),
+    Failed(String),
+}
 
 fn main() -> eframe::Result {
     let shared = Arc::new(Shared::new());
@@ -93,6 +104,21 @@ fn probe(shared: &Arc<Shared>) {
     }
 }
 
+/// Načte rozpis EiBi na pozadí - z cache, nebo ze sítě. Start aplikace
+/// na to nesmí čekat.
+fn spawn_schedule_load() -> Arc<std::sync::Mutex<ScheduleState>> {
+    let state = Arc::new(std::sync::Mutex::new(ScheduleState::Loading));
+    let s = state.clone();
+    std::thread::spawn(move || {
+        let r = match schedule::load_or_fetch() {
+            Ok(sch) => ScheduleState::Ready(sch),
+            Err(e) => ScheduleState::Failed(format!("{e}")),
+        };
+        *s.lock().unwrap() = r;
+    });
+    state
+}
+
 /// Ladicí vlákno. USB control transfer trvá jednotky ms, takže nesmí
 /// běžet v GUI ani v audio cestě.
 fn spawn_tuner(shared: Arc<Shared>) -> mpsc::Sender<f64> {
@@ -133,6 +159,8 @@ struct App {
     snap_at: Option<std::time::Instant>,
     /// Text z dekodéru. Drží se v GUI, aby přežil vypnutí dekodéru.
     console: String,
+    /// Rozpis EiBi. Načítá se na pozadí, ať start nečeká na síť.
+    schedule: Arc<std::sync::Mutex<ScheduleState>>,
     /// RGBA buffer vodopádu, řádek 0 = nejnovější.
     wf_pixels: Vec<u8>,
     wf_tex: Option<egui::TextureHandle>,
@@ -158,6 +186,7 @@ impl App {
             show_manage: false,
             snap_at: None,
             console: String::new(),
+            schedule: spawn_schedule_load(),
             wf_pixels: vec![0; FFT_SIZE * WF_HEIGHT * 4],
             wf_tex: None,
             last_generation: 0,
@@ -492,6 +521,64 @@ impl App {
         }
     }
 
+    /// Co by podle rozpisu mělo být slyšet na naladěné frekvenci.
+    ///
+    /// Jen pro AM - rozpis je rozhlasový, u SSB ani CW nedává smysl.
+    fn schedule_section(&mut self, ui: &mut egui::Ui) {
+        if self.set.mode != dsp::Mode::Am {
+            return;
+        }
+        ui.label(egui::RichText::new("Podle rozpisu").strong());
+
+        let tuned = self.tuned_khz();
+        let state = self.schedule.lock().unwrap();
+        match &*state {
+            ScheduleState::Loading => {
+                ui.label(egui::RichText::new("načítám rozpis...").weak());
+            }
+            ScheduleState::Failed(e) => {
+                ui.label(egui::RichText::new("rozpis se nenačetl").weak())
+                    .on_hover_text(e.clone());
+            }
+            ScheduleState::Ready(sch) => {
+                let found = sch.lookup(tuned, SCHEDULE_TOLERANCE_KHZ);
+                if found.is_empty() {
+                    ui.label(
+                        egui::RichText::new("na téhle frekvenci teď nic neplánují")
+                            .weak(),
+                    );
+                } else {
+                    for e in found.iter().take(6) {
+                        let mut line = e.station.clone();
+                        if !e.country.is_empty() {
+                            line.push_str(&format!(" · {}", e.country));
+                        }
+                        ui.label(line).on_hover_text(format!(
+                            "{:.0} kHz\n{:04}-{:04} UTC\njazyk: {}\ncíl: {}",
+                            e.freq_khz,
+                            e.start,
+                            e.end,
+                            if e.language.is_empty() { "?" } else { &e.language },
+                            if e.target.is_empty() { "?" } else { &e.target },
+                        ));
+                    }
+                    if found.len() > 6 {
+                        ui.label(
+                            egui::RichText::new(format!("...a dalších {}", found.len() - 6))
+                                .weak(),
+                        );
+                    }
+                }
+                ui.label(
+                    egui::RichText::new(format!("EiBi {}", sch.season))
+                        .weak()
+                        .size(9.0),
+                )
+                .on_hover_text("data z eibispace.de, čas v UTC");
+            }
+        }
+    }
+
     /// S-metr: úroveň naladěného signálu před AGC.
     ///
     /// Ukazuje dBFS, ne S-jednotky - přijímač nemá absolutní kalibraci,
@@ -575,6 +662,9 @@ impl App {
                 if let Some(st) = pick {
                     self.tune_station(&st);
                 }
+
+                ui.separator();
+                self.schedule_section(ui);
 
                 ui.separator();
                 if ui
