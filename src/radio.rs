@@ -65,6 +65,8 @@ pub struct Controls {
     pub mode: Mode,
     pub decoder: Decoder,
     pub rtty: RttyConfig,
+    /// Squelch CW v dB nad šumovým dnem.
+    pub cw_squelch_db: f32,
 }
 
 impl Default for Controls {
@@ -77,6 +79,7 @@ impl Default for Controls {
             mode: Mode::Am,
             decoder: Decoder::Off,
             rtty: RttyConfig::default(),
+            cw_squelch_db: crate::decode::CW_SQUELCH_DB,
         }
     }
 }
@@ -259,7 +262,7 @@ fn run(device: &str, shared: &Arc<Shared>, audio_tx: &mut rtrb::Producer<f32>) -
             continue;
         }
 
-        let (offset, volume, swap, bandwidth, mode, decoder, rtty) = {
+        let (offset, volume, swap, bandwidth, mode, decoder, rtty, squelch) = {
             let c = shared.controls.lock().unwrap();
             (
                 c.offset_hz,
@@ -269,12 +272,13 @@ fn run(device: &str, shared: &Arc<Shared>, audio_tx: &mut rtrb::Producer<f32>) -
                 c.mode,
                 c.decoder,
                 c.rtty,
+                c.cw_squelch_db,
             )
         };
         rx.set_offset(offset);
         rx.set_mode(mode);
         rx.set_bandwidth(bandwidth);
-        rx.set_decoder(decoder, rtty);
+        rx.set_decoder(decoder, rtty, squelch);
 
         iq.clear();
         for f in 0..frames {

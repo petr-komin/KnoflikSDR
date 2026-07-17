@@ -318,7 +318,7 @@ impl Demod {
     }
 
     /// Přepne dekodér. Rozdělaný znak se zahodí, což je při přepnutí v pořádku.
-    pub fn set_decoder(&mut self, kind: Decoder, rtty: RttyConfig) {
+    pub fn set_decoder(&mut self, kind: Decoder, rtty: RttyConfig, squelch_db: f32) {
         let rate = self.out_rate();
         let same_rtty = match &self.decoder {
             DecoderState::Rtty(d) => {
@@ -333,7 +333,7 @@ impl Demod {
         self.decoder = match kind {
             Decoder::Off => DecoderState::Off,
             Decoder::Rtty => DecoderState::Rtty(Box::new(RttyDecoder::new(rate, rtty))),
-            Decoder::Cw => DecoderState::Cw(Box::new(CwDecoder::new(rate))),
+            Decoder::Cw => DecoderState::Cw(Box::new(CwDecoder::new(rate, squelch_db))),
         };
     }
 

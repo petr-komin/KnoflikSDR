@@ -351,6 +351,7 @@ impl App {
             reverse: self.set.rtty_reverse,
             ..Default::default()
         };
+        c.cw_squelch_db = self.set.cw_squelch_db;
     }
 
     /// Konzole s textem z dekodéru.
@@ -391,6 +392,15 @@ impl App {
                     }
                     if self.set.decoder == decode::Decoder::Cw {
                         ui.separator();
+                        ui.add(
+                            egui::Slider::new(&mut self.set.cw_squelch_db, 3.0..=30.0)
+                                .text("squelch [dB]")
+                                .fixed_decimals(0),
+                        )
+                        .on_hover_text(
+                            "o kolik musí signál vyčnívat nad šum, aby se dekódoval\n\
+                             níž = citlivější, ale víc nesmyslů ze šumu",
+                        );
                         let wpm = self.shared.cw_wpm();
                         ui.label(egui::RichText::new(format!("~{wpm:.0} WPM")).weak())
                             .on_hover_text("odhadnuté tempo, dekodér si ho odvozuje sám");

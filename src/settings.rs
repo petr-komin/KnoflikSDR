@@ -56,6 +56,8 @@ pub struct Settings {
     pub decoder: Decoder,
     /// RTTY má v éteru běžně obě polarity, tak ať jde přehodit.
     pub rtty_reverse: bool,
+    /// Squelch CW: o kolik dB musí signál vyčnívat nad šum, aby se dekódoval.
+    pub cw_squelch_db: f32,
     pub show_console: bool,
     pub stations: Vec<Station>,
     /// Poslední místo na každém pásmu, klíčem je název z bandplanu.
@@ -82,6 +84,7 @@ impl Default for Settings {
             show_bandplan: true,
             decoder: Decoder::Off,
             rtty_reverse: false,
+            cw_squelch_db: crate::decode::CW_SQUELCH_DB,
             show_console: false,
             stations: Vec::new(),
             band_memory: BTreeMap::new(),
@@ -266,6 +269,7 @@ mod tests {
             show_bandplan: false,
             decoder: Decoder::Rtty,
             rtty_reverse: true,
+            cw_squelch_db: 14.0,
             show_console: true,
             band_memory: BTreeMap::new(),
             stations: vec![

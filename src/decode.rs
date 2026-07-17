@@ -304,16 +304,26 @@ fn morse_to_char(code: &str) -> Option<char> {
     MORSE.iter().find(|(_, m)| *m == code).map(|(c, _)| *c)
 }
 
+/// Výchozí squelch pro CW v dB nad šumovým dnem.
+pub const CW_SQUELCH_DB: f32 = 10.0;
+
 /// Dekodér CW s automatickým odhadem tempa.
 ///
 /// Délku tečky si odvozuje z nejkratších značek, které vidí - operátoři
 /// nedodržují tempo přesně a předepsané WPM by bylo k ničemu.
+///
+/// Squelch je nutnost: bez něj si dekodér najde "klíčování" i v čistém šumu,
+/// protože plovoucí práh se drží mezi špičkou a dnem, ať jsou kdekoli.
 pub struct CwDecoder {
     rate: f64,
     env: Smooth,
     /// Klouzavá špička a dno obálky pro plovoucí práh.
     peak: f32,
     floor: f32,
+    /// O kolik dB musí špička vyčnívat nad dno, aby to byl signál.
+    squelch_db: f32,
+    /// Je zrovna slyšet signál? Kvůli hlášení do GUI.
+    open: bool,
     on: bool,
     run: f64,
     /// Odhad délky tečky ve vzorcích.
@@ -325,12 +335,14 @@ pub struct CwDecoder {
 }
 
 impl CwDecoder {
-    pub fn new(rate: f64) -> Self {
+    pub fn new(rate: f64, squelch_db: f32) -> Self {
         CwDecoder {
             rate,
             env: Smooth::new(50.0, rate),
             peak: 0.0,
             floor: 0.0,
+            squelch_db,
+            open: false,
             on: false,
             run: 0.0,
             // Výchozí odhad ~20 WPM (tečka 60 ms).
@@ -361,6 +373,20 @@ impl CwDecoder {
         } else {
             self.floor += (e - self.floor) * 0.00002;
         }
+        // Squelch: o kolik špička vyčnívá nad dno. V čistém šumu je to pár dB,
+        // u skutečné CW desítky. Bez téhle brzdy by se dekódoval šum.
+        let snr_db = 20.0 * (self.peak / self.floor.max(1e-9)).max(1.0).log10();
+        self.open = snr_db >= self.squelch_db;
+        if !self.open {
+            // Zavřeno: zahodíme rozdělaný znak a mlčíme.
+            self.code.clear();
+            self.on = false;
+            self.run = 0.0;
+            self.silence = 0.0;
+            self.emitted_space = true;
+            return None;
+        }
+
         let span = (self.peak - self.floor).max(1e-6);
         // Hystereze, ať šum nepřeklápí klíč.
         let hi = self.floor + span * 0.6;
@@ -533,10 +559,49 @@ mod tests {
         out
     }
 
+    /// Jednoduchý deterministický generátor šumu, ať je test opakovatelný.
+    struct Noise(u64);
+    impl Noise {
+        fn next(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((self.0 >> 33) as f32 / (1u32 << 31) as f32) - 1.0
+        }
+    }
+
+    /// Bez squelche si dekodér najde "klíčování" i v čistém šumu a chrlí
+    /// otazníky. Tohle je přesně ta chyba, kvůli které squelch existuje.
+    #[test]
+    fn cw_v_sumu_mlci() {
+        let mut n = Noise(12345);
+        let sig: Vec<Complex32> = (0..RATE as usize * 5)
+            .map(|_| Complex32::new(n.next() * 0.05, n.next() * 0.05))
+            .collect();
+        let mut d = CwDecoder::new(RATE, CW_SQUELCH_DB);
+        let text: String = sig.iter().filter_map(|&z| d.push(z)).collect();
+        assert!(
+            text.trim().is_empty(),
+            "z čistého šumu vylezlo {:?}",
+            text.trim()
+        );
+    }
+
+    /// Squelch nesmí ukousnout skutečný signál se šumem na pozadí.
+    #[test]
+    fn cw_se_sumem_na_pozadi_projde() {
+        let mut n = Noise(999);
+        let sig: Vec<Complex32> = make_cw("TEST", 20.0)
+            .into_iter()
+            .map(|z| Complex32::new(z.re + n.next() * 0.02, z.im + n.next() * 0.02))
+            .collect();
+        let mut d = CwDecoder::new(RATE, CW_SQUELCH_DB);
+        let text: String = sig.iter().filter_map(|&z| d.push(z)).collect();
+        assert_eq!(text.trim(), "TEST", "dekódováno {text:?}");
+    }
+
     #[test]
     fn cw_dekoduje_volacku() {
         let sig = make_cw("CQ DE OK1ABC", 20.0);
-        let mut d = CwDecoder::new(RATE);
+        let mut d = CwDecoder::new(RATE, CW_SQUELCH_DB);
         let text: String = sig.iter().filter_map(|&z| d.push(z)).collect();
         let text = text.trim().to_string();
         assert_eq!(text, "CQ DE OK1ABC", "dekódováno {text:?}");
@@ -547,7 +612,7 @@ mod tests {
         // Dekodér si musí tempo odvodit sám, ne spoléhat na přednastavení.
         for wpm in [12.0, 25.0] {
             let sig = make_cw("TEST", wpm);
-            let mut d = CwDecoder::new(RATE);
+            let mut d = CwDecoder::new(RATE, CW_SQUELCH_DB);
             let text: String = sig.iter().filter_map(|&z| d.push(z)).collect();
             assert_eq!(text.trim(), "TEST", "při {wpm} WPM dekódováno {text:?}");
         }
