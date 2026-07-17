@@ -12,6 +12,7 @@
 
 use anyhow::{anyhow, Result};
 use chrono::{Datelike, Timelike, Utc, Weekday};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -102,9 +103,101 @@ impl Entry {
     }
 }
 
+/// Vysvětlivky zkratek z README.TXT od EiBi: země, jazyky a cílové oblasti.
+///
+/// Bere se to z autoritativního zdroje místo vlastní tabulky, ať to nezastará
+/// a ať se nemusí ručně udržovat 300 názvů zemí.
+#[derive(Default)]
+pub struct Codes {
+    pub countries: BTreeMap<String, String>,
+    pub languages: BTreeMap<String, String>,
+    pub targets: BTreeMap<String, String>,
+}
+
+impl Codes {
+    pub fn country(&self, code: &str) -> Option<&str> {
+        self.countries.get(code).map(|s| s.as_str())
+    }
+    pub fn language(&self, code: &str) -> Option<&str> {
+        self.languages.get(code).map(|s| s.as_str())
+    }
+    pub fn target(&self, code: &str) -> Option<&str> {
+        self.targets.get(code).map(|s| s.as_str())
+    }
+
+    /// Rozebere README.TXT. Sekce se poznají podle nadpisů "I) Language codes."
+    /// atd.; uvnitř je vždy odsazený kód a za mezerami jeho význam.
+    pub fn parse(text: &str) -> Codes {
+        #[derive(PartialEq, Clone, Copy)]
+        enum Sec {
+            None,
+            Lang,
+            Country,
+            Target,
+        }
+        let mut sec = Sec::None;
+        let mut c = Codes::default();
+
+        for line in text.lines() {
+            let t = line.trim();
+            // Nadpisy sekcí. Ten se seznamem obsahu na začátku má za textem
+            // ještě další mezery, ale rozlišovat ho netřeba - přepne se to
+            // do stejné sekce a druhý výskyt ji jen potvrdí.
+            if t.starts_with("I) Language codes") {
+                sec = Sec::Lang;
+                continue;
+            } else if t.starts_with("II) Country codes") {
+                sec = Sec::Country;
+                continue;
+            } else if t.starts_with("III) Target-area codes") {
+                sec = Sec::Target;
+                continue;
+            } else if t.starts_with("IV) Transmitter") {
+                sec = Sec::None;
+                continue;
+            }
+            if sec == Sec::None || t.is_empty() {
+                continue;
+            }
+            // Kódy jsou odsazené; neodsazené řádky jsou vysvětlující odstavce.
+            if !line.starts_with("   ") {
+                continue;
+            }
+            let Some((code, rest)) = t.split_once(char::is_whitespace) else {
+                continue;
+            };
+            let mut name = rest.trim();
+            // Cílové oblasti se píší jako "Af  - Africa".
+            if let Some(r) = name.strip_prefix("- ") {
+                name = r.trim();
+            }
+            // U jazyků je vzadu ISO kód v hranatých závorkách.
+            if let Some(i) = name.rfind(" [") {
+                if name.ends_with(']') {
+                    name = name[..i].trim();
+                }
+            }
+            // Hvězdička u zemí znamená "není samostatný stát" - nezajímá nás.
+            let name = name.trim_end_matches(" *").trim();
+            if code.is_empty() || name.is_empty() {
+                continue;
+            }
+            let map = match sec {
+                Sec::Lang => &mut c.languages,
+                Sec::Country => &mut c.countries,
+                Sec::Target => &mut c.targets,
+                Sec::None => continue,
+            };
+            map.entry(code.to_string()).or_insert_with(|| name.to_string());
+        }
+        c
+    }
+}
+
 pub struct Schedule {
     pub entries: Vec<Entry>,
     pub season: String,
+    pub codes: Codes,
 }
 
 fn parse_hhmm(s: &str) -> Option<u16> {
@@ -116,7 +209,14 @@ fn parse_hhmm(s: &str) -> Option<u16> {
 }
 
 impl Schedule {
+    /// Rozpis bez vysvětlivek. Používají to testy; aplikace jde přes
+    /// `parse_with_codes`.
+    #[cfg(test)]
     pub fn parse(text: &str, season: &str) -> Schedule {
+        Self::parse_with_codes(text, season, Codes::default())
+    }
+
+    pub fn parse_with_codes(text: &str, season: &str, codes: Codes) -> Schedule {
         let mut entries = Vec::new();
         for line in text.lines().skip(1) {
             let f: Vec<&str> = line.split(';').collect();
@@ -147,6 +247,7 @@ impl Schedule {
         Schedule {
             entries,
             season: season.to_string(),
+            codes,
         }
     }
 
@@ -229,6 +330,13 @@ pub fn current_season() -> String {
     }
 }
 
+fn cache_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("knoflik-sdr"))
+}
+
 fn cache_path(season: &str) -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -244,20 +352,9 @@ fn latin1_to_string(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| b as char).collect()
 }
 
-/// Načte rozpis z cache, a když tam není, stáhne ho.
-pub fn load_or_fetch() -> Result<Schedule> {
-    let season = current_season();
-    let path = cache_path(&season).ok_or_else(|| anyhow!("nelze určit adresář cache"))?;
-
-    // V cache je už UTF-8, protože ho tam ukládáme převedený.
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        let s = Schedule::parse(&text, &season);
-        if !s.entries.is_empty() {
-            return Ok(s);
-        }
-    }
-
-    let url = format!("http://www.eibispace.de/dx/sked-{season}.csv");
+/// Stáhne soubor z eibispace.de a převede z Latin-1.
+fn fetch(name: &str) -> Result<String> {
+    let url = format!("http://www.eibispace.de/dx/{name}");
     let mut body = Vec::new();
     ureq::get(&url)
         .call()
@@ -266,9 +363,50 @@ pub fn load_or_fetch() -> Result<Schedule> {
         .as_reader()
         .read_to_end(&mut body)
         .map_err(|e| anyhow!("čtení odpovědi selhalo: {e}"))?;
-    let text = latin1_to_string(&body);
+    Ok(latin1_to_string(&body))
+}
 
-    let s = Schedule::parse(&text, &season);
+/// Vysvětlivky zkratek. Bez nich se dá žít, tak se chyba nehlásí -
+/// ukáže se prostě holý kód.
+fn load_codes() -> Codes {
+    let path = cache_dir().map(|d| d.join("eibi-readme.txt"));
+    if let Some(p) = &path {
+        if let Ok(text) = std::fs::read_to_string(p) {
+            let c = Codes::parse(&text);
+            if !c.countries.is_empty() {
+                return c;
+            }
+        }
+    }
+    match fetch("README.TXT") {
+        Ok(text) => {
+            if let Some(p) = &path {
+                if let Some(d) = p.parent() {
+                    let _ = std::fs::create_dir_all(d);
+                }
+                let _ = std::fs::write(p, &text);
+            }
+            Codes::parse(&text)
+        }
+        Err(_) => Codes::default(),
+    }
+}
+
+/// Načte rozpis z cache, a když tam není, stáhne ho.
+pub fn load_or_fetch() -> Result<Schedule> {
+    let season = current_season();
+    let path = cache_path(&season).ok_or_else(|| anyhow!("nelze určit adresář cache"))?;
+
+    // V cache je už UTF-8, protože ho tam ukládáme převedený.
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let s = Schedule::parse_with_codes(&text, &season, load_codes());
+        if !s.entries.is_empty() {
+            return Ok(s);
+        }
+    }
+
+    let text = fetch(&format!("sked-{season}.csv"))?;
+    let s = Schedule::parse_with_codes(&text, &season, load_codes());
     if s.entries.is_empty() {
         return Err(anyhow!("rozpis {season} se stáhl, ale nedal se přečíst"));
     }
@@ -425,6 +563,29 @@ mod tests {
         println!("záznamů přes půlnoc: {pres_pulnoc}");
         assert!(pres_pulnoc > 10, "žádné přes půlnoc? {pres_pulnoc}");
 
+        println!(
+            "vysvětlivky: {} zemí, {} jazyků, {} cílových oblastí",
+            s.codes.countries.len(),
+            s.codes.languages.len(),
+            s.codes.targets.len()
+        );
+        assert!(s.codes.countries.len() > 200, "málo zemí: {}", s.codes.countries.len());
+        // Pozor: EiBi píše "Brasil", ne "Brazil".
+        for (k, v) in [("CHN", "China"), ("B", "Brasil"), ("D", "Germany"), ("G", "United")] {
+            let got = s.codes.country(k).unwrap_or("???");
+            println!("  {k:4} -> {got}");
+            assert!(got.contains(v), "{k} přeloženo jako {got}");
+        }
+        // Kolik kódů zemí z rozpisu umíme vysvětlit?
+        let total = s.entries.len();
+        let znamych = s
+            .entries
+            .iter()
+            .filter(|e| e.country.is_empty() || s.codes.country(&e.country).is_some())
+            .count();
+        println!("vysvětlených zemí u záznamů: {znamych}/{total}");
+        assert!(znamych * 100 / total > 95, "moc nevysvětlených zemí");
+
         let now = Utc::now();
         println!("teď je {} UTC", now.format("%a %H:%M"));
         for f in [6060.0, 7300.0, 9400.0, 5900.0] {
@@ -450,6 +611,48 @@ mod tests {
         let sch = Schedule::parse(&format!("hlavicka\n{s}\n"), "a26");
         assert_eq!(sch.entries.len(), 1);
         assert_eq!(sch.entries[0].station, "Rádio Clube do Pará");
+    }
+
+    #[test]
+    fn kody_se_rozeberou_ze_readme() {
+        let readme = "\
+nejaky uvod
+   I) Language codes.
+
+   E     English (400m)                                        [eng]
+   TW    Taiwanese/Fujian (CHN 25m)                            [nan]
+
+   II) Country codes.
+
+   B    Brazil
+   CHN  China (People's Republic)
+   CLA  Clandestine stations *
+   D    Germany
+
+   III) Target-area codes.
+   Af  - Africa
+   SEA - Southeast Asia
+
+   IV) Transmitter site codes.
+   CHN: a-Baoji-Xinjie
+";
+        let c = Codes::parse(readme);
+        assert_eq!(c.country("CHN"), Some("China (People's Republic)"));
+        assert_eq!(c.country("B"), Some("Brazil"), "jednopísmenné kódy jsou ty nejmatoucí");
+        assert_eq!(c.country("D"), Some("Germany"));
+        // Hvězdička značí "není samostatný stát" - do názvu nepatří.
+        assert_eq!(c.country("CLA"), Some("Clandestine stations"));
+        // ISO kód v závorce se má useknout.
+        assert_eq!(c.language("E"), Some("English (400m)"));
+        assert_eq!(c.target("SEA"), Some("Southeast Asia"));
+        // Sekce IV nesmí protéct do zemí.
+        assert!(c.country("CHN:").is_none(), "sekce vysílačů se nemá číst");
+    }
+
+    #[test]
+    fn neznamy_kod_vrati_nic() {
+        let c = Codes::default();
+        assert!(c.country("XYZ").is_none());
     }
 
     #[test]

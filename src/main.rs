@@ -548,19 +548,40 @@ impl App {
                             .weak(),
                     );
                 } else {
-                    for e in found.iter().take(6) {
-                        let mut line = e.station.clone();
-                        if !e.country.is_empty() {
-                            line.push_str(&format!(" · {}", e.country));
+                    // Zkratky rozepisujeme - "B" nebo "CLA" nikomu nic neřekne.
+                    let explain = |code: &str, full: Option<&str>| -> String {
+                        match full {
+                            Some(f) if !code.is_empty() => format!("{f} ({code})"),
+                            _ if code.is_empty() => "?".to_string(),
+                            _ => code.to_string(),
                         }
-                        ui.label(line).on_hover_text(format!(
-                            "{:.0} kHz\n{:04}-{:04} UTC\njazyk: {}\ncíl: {}",
+                    };
+                    for e in found.iter().take(6) {
+                        let tip = format!(
+                            "{:.0} kHz\n{:04}-{:04} UTC\nzemě: {}\njazyk: {}\ncíl: {}",
                             e.freq_khz,
                             e.start,
                             e.end,
-                            if e.language.is_empty() { "?" } else { &e.language },
-                            if e.target.is_empty() { "?" } else { &e.target },
-                        ));
+                            explain(&e.country, sch.codes.country(&e.country)),
+                            explain(&e.language, sch.codes.language(&e.language)),
+                            explain(&e.target, sch.codes.target(&e.target)),
+                        );
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.label(&e.station);
+                            if !e.country.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        sch.codes.country(&e.country).unwrap_or(&e.country),
+                                    )
+                                    .weak()
+                                    .size(10.0),
+                                );
+                            }
+                        })
+                        .response
+                        .on_hover_text(tip);
+                        ui.add_space(3.0);
                     }
                     if found.len() > 6 {
                         ui.label(
