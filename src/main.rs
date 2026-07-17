@@ -179,7 +179,9 @@ impl App {
     fn band_edges(&self) -> (f64, f64) {
         let bw = self.bandwidth_hz();
         match self.set.mode {
-            dsp::Mode::Am => (self.set.offset_hz - bw / 2.0, self.set.offset_hz + bw / 2.0),
+            dsp::Mode::Am | dsp::Mode::Cw => {
+                (self.set.offset_hz - bw / 2.0, self.set.offset_hz + bw / 2.0)
+            }
             dsp::Mode::Usb => (self.set.offset_hz, self.set.offset_hz + bw),
             dsp::Mode::Lsb => (self.set.offset_hz - bw, self.set.offset_hz),
         }
@@ -190,7 +192,7 @@ impl App {
     fn draggable_edges(&self) -> Vec<f64> {
         let (lo, hi) = self.band_edges();
         match self.set.mode {
-            dsp::Mode::Am => vec![lo, hi],
+            dsp::Mode::Am | dsp::Mode::Cw => vec![lo, hi],
             dsp::Mode::Usb => vec![hi],
             dsp::Mode::Lsb => vec![lo],
         }
@@ -290,10 +292,10 @@ impl App {
         } else {
             dsp::Mode::Usb
         };
-        let bw = if mode.is_ssb() {
-            radio::SSB_BANDWIDTH_HZ
-        } else {
-            radio::AM_BANDWIDTH_HZ
+        let bw = match mode {
+            dsp::Mode::Cw => radio::CW_BANDWIDTH_HZ,
+            dsp::Mode::Usb | dsp::Mode::Lsb => radio::SSB_BANDWIDTH_HZ,
+            dsp::Mode::Am => radio::AM_BANDWIDTH_HZ,
         };
         self.tune_to(band.middle_khz(), mode, bw);
     }
@@ -610,7 +612,7 @@ impl App {
                                     .selected_text(st.mode.label())
                                     .width(60.0)
                                     .show_ui(ui, |ui| {
-                                        for m in [dsp::Mode::Am, dsp::Mode::Usb, dsp::Mode::Lsb] {
+                                        for m in [dsp::Mode::Am, dsp::Mode::Usb, dsp::Mode::Lsb, dsp::Mode::Cw] {
                                             ui.selectable_value(&mut st.mode, m, m.label());
                                         }
                                     });
@@ -724,7 +726,7 @@ impl App {
                     // U AM řídí obě hrany totéž (pásmo je symetrické),
                     // u SSB je šířka rovnou vzdálenost hrany od nosné.
                     let bw = match self.set.mode {
-                        dsp::Mode::Am => d.abs() * 2.0,
+                        dsp::Mode::Am | dsp::Mode::Cw => d.abs() * 2.0,
                         dsp::Mode::Usb => d,
                         dsp::Mode::Lsb => -d,
                     };
@@ -944,7 +946,7 @@ impl eframe::App for App {
                     );
                 }
                 ui.separator();
-                for m in [dsp::Mode::Am, dsp::Mode::Usb, dsp::Mode::Lsb] {
+                for m in [dsp::Mode::Am, dsp::Mode::Usb, dsp::Mode::Lsb, dsp::Mode::Cw] {
                     ui.selectable_value(&mut self.set.mode, m, m.label());
                 }
                 ui.separator();
@@ -1303,7 +1305,7 @@ impl eframe::App for App {
         self.autosave.tick(self.set.clone());
     }
 
-    fn on_exit(&mut self) {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.autosave.flush();
         self.shared.running.store(false, Ordering::Relaxed);
     }

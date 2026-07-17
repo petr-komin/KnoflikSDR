@@ -12,7 +12,16 @@ categories = ["science", "multimedia::audio"]
 [dependencies]
 alsa = "0.11"
 anyhow = "1.0.103"
-eframe = "0.35.0"
+# Záměrně glow (OpenGL) místo výchozího wgpu. wgpu na Linuxu chce Vulkan,
+# a když pro kartu není Vulkan ovladač, spadne do softwarového llvmpipe -
+# ten pak vykreslováním sežere klidně šest jader. OpenGL bývá funkční vždy.
+eframe = { version = "0.35.0", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 egui = "0.35.0"
 num-complex = "0.4.6"
 rtrb = "0.3.4"

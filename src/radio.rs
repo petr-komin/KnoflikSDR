@@ -28,12 +28,19 @@ pub const SSB_BANDWIDTH_HZ: f64 = 2_700.0;
 /// (audio do 12 kHz) stejně víc než dost. U SSB nemá smysl jít nad
 /// šířku fonického kanálu.
 pub fn bandwidth_range(mode: Mode) -> (f64, f64) {
-    if mode.is_ssb() {
-        (800.0, 4_000.0)
-    } else {
-        (2_000.0, 24_000.0)
+    match mode {
+        Mode::Cw => (CW_MIN_BANDWIDTH_HZ, 2_000.0),
+        Mode::Usb | Mode::Lsb => (400.0, 4_000.0),
+        Mode::Am => (1_000.0, 24_000.0),
     }
 }
+
+/// Nejužší poctivý CW filtr. Změřeno: kanálový filtr na 48 kHz s 1023
+/// koeficienty trefí -6 dB bod na hertz přesně až sem; při 100 Hz už
+/// vyjde 58 místo 50 Hz.
+pub const CW_MIN_BANDWIDTH_HZ: f64 = 150.0;
+/// Výchozí šířka pro CW - obvyklá volba pro běžný provoz.
+pub const CW_BANDWIDTH_HZ: f64 = 500.0;
 
 /// Co zkusit na vstupu, od nejlepšího. Vyšší vzorkovačka = širší panorama,
 /// 24 bit = větší dynamický rozsah.

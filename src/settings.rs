@@ -42,6 +42,7 @@ pub struct Settings {
     /// režimu zdědilo nesmyslnou hodnotu z toho druhého.
     pub bandwidth_am_hz: f64,
     pub bandwidth_ssb_hz: f64,
+    pub bandwidth_cw_hz: f64,
     pub volume: f32,
     pub swap_iq: bool,
     pub db_min: f32,
@@ -70,6 +71,7 @@ impl Default for Settings {
             mode: Mode::Am,
             bandwidth_am_hz: crate::radio::AM_BANDWIDTH_HZ,
             bandwidth_ssb_hz: crate::radio::SSB_BANDWIDTH_HZ,
+            bandwidth_cw_hz: crate::radio::CW_BANDWIDTH_HZ,
             volume: 0.5,
             swap_iq: false,
             db_min: -110.0,
@@ -90,18 +92,18 @@ impl Default for Settings {
 impl Settings {
     /// Šířka pásma pro aktuální režim.
     pub fn bandwidth(&self) -> f64 {
-        if self.mode.is_ssb() {
-            self.bandwidth_ssb_hz
-        } else {
-            self.bandwidth_am_hz
+        match self.mode {
+            Mode::Cw => self.bandwidth_cw_hz,
+            Mode::Usb | Mode::Lsb => self.bandwidth_ssb_hz,
+            Mode::Am => self.bandwidth_am_hz,
         }
     }
 
     pub fn set_bandwidth(&mut self, bw: f64) {
-        if self.mode.is_ssb() {
-            self.bandwidth_ssb_hz = bw;
-        } else {
-            self.bandwidth_am_hz = bw;
+        match self.mode {
+            Mode::Cw => self.bandwidth_cw_hz = bw,
+            Mode::Usb | Mode::Lsb => self.bandwidth_ssb_hz = bw,
+            Mode::Am => self.bandwidth_am_hz = bw,
         }
     }
 }
@@ -253,6 +255,7 @@ mod tests {
             mode: Mode::Lsb,
             bandwidth_am_hz: 5500.0,
             bandwidth_ssb_hz: 2400.0,
+            bandwidth_cw_hz: 500.0,
             volume: 0.33,
             swap_iq: true,
             db_min: -120.0,
@@ -387,5 +390,12 @@ mod tests {
         assert_eq!(s.bandwidth(), 9000.0);
         s.mode = Mode::Lsb;
         assert_eq!(s.bandwidth(), 2400.0, "USB a LSB sdílejí jednu šířku");
+        // CW má vlastní, ať nezdědí 9 kHz z AM.
+        s.mode = Mode::Cw;
+        s.set_bandwidth(300.0);
+        s.mode = Mode::Am;
+        assert_eq!(s.bandwidth(), 9000.0);
+        s.mode = Mode::Cw;
+        assert_eq!(s.bandwidth(), 300.0);
     }
 }

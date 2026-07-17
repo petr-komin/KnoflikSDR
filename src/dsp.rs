@@ -1,21 +1,29 @@
-//! DSP řetězec pro AM a SSB příjem z I/Q.
+//! DSP řetězec pro AM, SSB a CW příjem z I/Q.
 //!
-//! 96 kHz I/Q -> směšovač na offset -> komplexní filtr + decimace /2
-//! -> 48 kHz -> detektor podle režimu -> odstranění DC -> AGC -> 48 kHz audio.
+//! 96 kHz I/Q -> směšovač na offset -> antialiasingová propust + decimace /2
+//! -> 48 kHz -> kanálový filtr -> detektor podle režimu -> odstranění DC
+//! -> AGC -> 48 kHz audio.
 //!
-//! Filtr má komplexní koeficienty, takže může být nesymetrický kolem nosné -
-//! přesně to dělá z I/Q jednopásmový příjem: propustíme jen jednu stranu
-//! spektra a reálná složka výsledku je rovnou zvuk.
+//! Filtr je záměrně až za decimací. Na čtvrtinové vzorkovačce je při stejném
+//! počtu koeficientů čtyřikrát ostřejší, takže jde udělat i 150 Hz CW filtr;
+//! před decimací by přechodové pásmo bylo širší než celá propust.
+//!
+//! Kanálový filtr má komplexní koeficienty, takže může být nesymetrický kolem
+//! nosné - přesně to dělá z I/Q jednopásmový příjem: propustíme jen jednu
+//! stranu spektra a reálná složka výsledku je rovnou zvuk.
 
 use crate::decode::{CwDecoder, Decoder, RttyConfig, RttyDecoder};
 use num_complex::Complex32;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
-/// Počet koeficientů FIR filtru. Konstantní, aby šlo měnit šířku pásma
-/// i režim bez zahození historie. Při 96 kHz vychází přechodové pásmo
-/// na ~300 Hz, což stačí i na SSB.
-const FIR_TAPS: usize = 511;
+/// Koeficienty antialiasingové propusti před decimací. Je široká, takže
+/// jich stačí málo.
+const PRE_TAPS: usize = 127;
+/// Koeficienty kanálového filtru. Ten běží až za decimací, tedy na čtvrtinové
+/// vzorkovačce - proto při stejném počtu koeficientů vyjde přechodové pásmo
+/// mnohem užší a dá se dělat pořádný CW filtr.
+const CHAN_TAPS: usize = 1023;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Mode {
@@ -23,6 +31,7 @@ pub enum Mode {
     Am,
     Usb,
     Lsb,
+    Cw,
 }
 
 impl Mode {
@@ -31,6 +40,7 @@ impl Mode {
             Mode::Am => "AM",
             Mode::Usb => "USB",
             Mode::Lsb => "LSB",
+            Mode::Cw => "CW",
         }
     }
 
@@ -38,6 +48,10 @@ impl Mode {
         matches!(self, Mode::Usb | Mode::Lsb)
     }
 }
+
+/// Výška tónu CW na výstupu. Filtr je centrovaný na nosnou, takže se
+/// pípání musí vyrobit až tady - stejně jako BFO v klasickém přijímači.
+pub const CW_PITCH_HZ: f64 = 700.0;
 
 /// Číslicově řízený oscilátor. Fázi držíme v f64, sin/cos při 96 kHz
 /// je zanedbatelná zátěž a nehrozí kumulace chyby jako u inkrementální rotace.
@@ -103,7 +117,8 @@ pub fn lowpass_taps(cutoff_hz: f64, sample_rate: f64, n: usize) -> Vec<f32> {
 pub fn filter_taps(mode: Mode, bandwidth_hz: f64, sample_rate: f64, n: usize) -> Vec<Complex32> {
     let proto = lowpass_taps(bandwidth_hz / 2.0, sample_rate, n);
     let shift = match mode {
-        Mode::Am => 0.0,
+        // AM i CW jsou symetrické kolem nosné.
+        Mode::Am | Mode::Cw => 0.0,
         Mode::Usb => bandwidth_hz / 2.0,
         Mode::Lsb => -bandwidth_hz / 2.0,
     };
@@ -239,7 +254,12 @@ impl Agc {
 /// Kompletní přijímač: I/Q dovnitř, mono audio ven.
 pub struct Demod {
     nco: Nco,
-    fir: FirDecim,
+    /// Antialiasingová propust + decimace na výstupní vzorkovačku.
+    pre: FirDecim,
+    /// Kanálový filtr, běží až za decimací (decim = 1).
+    chan: FirDecim,
+    /// BFO pro CW - vyrábí slyšitelný tón z nosné, která leží na DC.
+    bfo: Nco,
     dc: DcBlock,
     agc: Agc,
     in_rate: f64,
@@ -273,10 +293,19 @@ impl DecoderState {
 impl Demod {
     pub fn new(in_rate: f64, decim: usize, bandwidth_hz: f64, mode: Mode) -> Self {
         let out_rate = in_rate / decim as f64;
-        let taps = filter_taps(mode, bandwidth_hz, in_rate, FIR_TAPS);
+        // Před decimací stačí zahradit alias: propust těsně pod Nyquistem
+        // výstupní vzorkovačky. Tvarování kanálu dělá až druhý stupeň.
+        let pre: Vec<Complex32> = lowpass_taps(out_rate * 0.45, in_rate, PRE_TAPS)
+            .into_iter()
+            .map(|h| Complex32::new(h, 0.0))
+            .collect();
+        let mut bfo = Nco::new();
+        bfo.set_freq(-CW_PITCH_HZ, out_rate);
         Demod {
             nco: Nco::new(),
-            fir: FirDecim::new(taps, decim),
+            pre: FirDecim::new(pre, decim),
+            chan: FirDecim::new(filter_taps(mode, bandwidth_hz, out_rate, CHAN_TAPS), 1),
+            bfo,
             dc: DcBlock::new(0.995),
             agc: Agc::new(out_rate as f32),
             in_rate,
@@ -309,7 +338,7 @@ impl Demod {
     }
 
     fn out_rate(&self) -> f64 {
-        self.in_rate / self.fir.decim as f64
+        self.in_rate / self.pre.decim as f64
     }
 
     /// Odhad tempa CW ve WPM, pokud zrovna běží CW dekodér.
@@ -353,19 +382,21 @@ impl Demod {
     }
 
     fn refresh_taps(&mut self) {
-        self.fir.set_taps(filter_taps(
-            self.mode,
-            self.bandwidth_hz,
-            self.in_rate,
-            FIR_TAPS,
-        ));
+        let rate = self.out_rate();
+        self.chan
+            .set_taps(filter_taps(self.mode, self.bandwidth_hz, rate, CHAN_TAPS));
     }
 
     /// Zpracuje blok I/Q vzorků a připojí audio na konec `out`.
     pub fn process(&mut self, iq: &[Complex32], out: &mut Vec<f32>) {
         for &x in iq {
             let mixed = x * self.nco.next();
-            if let Some(z) = self.fir.push(mixed) {
+            // Stupeň 1: zahradit alias a decimovat. Stupeň 2: vytvarovat kanál
+            // - na nižší vzorkovačce je stejný počet koeficientů mnohem ostřejší.
+            let Some(decimated) = self.pre.push(mixed) else {
+                continue;
+            };
+            if let Some(z) = self.chan.push(decimated) {
                 // Dekodér dostane pásmo za filtrem, ale před detekcí a AGC -
                 // AGC by mu rozhoupala úrovně pod rukama.
                 match &mut self.decoder {
@@ -387,6 +418,8 @@ impl Demod {
                     // SSB: filtr už nechal jen jednu stranu spektra, takže
                     // reálná složka je přímo zvuk.
                     Mode::Usb | Mode::Lsb => z.re,
+                    // CW: nosná leží na DC, tak ji BFO posune na slyšitelný tón.
+                    Mode::Cw => (z * self.bfo.next()).re,
                 };
                 let audio = self.dc.push(detected);
                 out.push(self.agc.push(audio));
@@ -419,16 +452,53 @@ mod tests {
             if response_db(taps, f, fs) < target_db {
                 return f;
             }
-            f += 10.0;
+            f += 2.0;
         }
         fs / 2.0
     }
 
     #[test]
+    fn zmer_uzke_filtry() {
+        // Kanálový filtr běží na výstupní vzorkovačce, ne na vstupní.
+        let fs = 48_000.0;
+        println!("\nkanálový filtr: {CHAN_TAPS} koef. @ {fs} Hz");
+        println!(" šířka   žádaný -6dB   skutečný -6dB   -60dB");
+        for bw in [100.0, 150.0, 200.0, 250.0, 300.0, 500.0, 800.0] {
+            let taps = filter_taps(Mode::Cw, bw, fs, CHAN_TAPS);
+            println!(
+                "{:6.0} Hz {:8.0} Hz  {:11.0} Hz  {:7.0} Hz",
+                bw,
+                bw / 2.0,
+                cutoff_at(&taps, fs, -6.0),
+                cutoff_at(&taps, fs, -60.0)
+            );
+        }
+    }
+
+    #[test]
     fn lowpass_ma_jednotkovy_zisk_v_dc() {
-        let taps = lowpass_taps(5000.0, 96000.0, FIR_TAPS);
+        let taps = lowpass_taps(5000.0, 96000.0, CHAN_TAPS);
         let sum: f32 = taps.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "součet koeficientů = {sum}");
+    }
+
+    /// CW filtr musí být poctivý i v těch nejužších polohách - tam je to
+    /// nejcennější a zároveň nejsnáz se to rozbije.
+    #[test]
+    fn uzky_cw_filtr_odpovida_stitku() {
+        let fs = 48_000.0;
+        let (min, max) = crate::radio::bandwidth_range(Mode::Cw);
+        let mut bw = min;
+        while bw <= max {
+            let taps = filter_taps(Mode::Cw, bw, fs, CHAN_TAPS);
+            let f6 = cutoff_at(&taps, fs, -6.0);
+            assert!(
+                (f6 - bw / 2.0).abs() <= 5.0,
+                "CW {bw} Hz: -6 dB vyšlo na {f6} Hz místo {} Hz",
+                bw / 2.0
+            );
+            bw += 50.0;
+        }
     }
 
     /// V celém povoleném rozsahu musí -6 dB bod odpovídat tomu, co uživatel
@@ -436,11 +506,12 @@ mod tests {
     /// štítek by přestal platit a tenhle test spadne.
     #[test]
     fn sirka_pasma_am_odpovida_stitku() {
-        let fs = 96_000.0;
+        // Kanálový filtr běží na výstupní vzorkovačce.
+        let fs = 48_000.0;
         let (min, max) = crate::radio::bandwidth_range(Mode::Am);
         let mut bw = min;
         while bw <= max {
-            let taps = filter_taps(Mode::Am, bw, fs, FIR_TAPS);
+            let taps = filter_taps(Mode::Am, bw, fs, CHAN_TAPS);
             let f6 = cutoff_at(&taps, fs, -6.0);
             assert!(
                 (f6 - bw / 2.0).abs() <= 100.0,
@@ -455,10 +526,10 @@ mod tests {
     /// jinak by se do zvuku složil aliasing.
     #[test]
     fn nejsirsi_pasmo_nealiasuje() {
-        let fs = 96_000.0;
-        let nyquist_po_decimaci = fs / 2.0 / 2.0; // decimace /2 -> 48 kHz -> 24 kHz
+        let fs = 48_000.0;
+        let nyquist_po_decimaci = fs / 2.0;
         let (_, max) = crate::radio::bandwidth_range(Mode::Am);
-        let taps = filter_taps(Mode::Am, max, fs, FIR_TAPS);
+        let taps = filter_taps(Mode::Am, max, fs, CHAN_TAPS);
         let f60 = cutoff_at(&taps, fs, -60.0);
         assert!(
             f60 < nyquist_po_decimaci,
@@ -470,13 +541,13 @@ mod tests {
     /// tu druhou. Bez toho by USB i LSB zněly stejně.
     #[test]
     fn ssb_potlacuje_opacne_postranni_pasmo() {
-        let fs = 96_000.0;
+        let fs = 48_000.0;
         let bw = 2700.0;
         for (mode, want, unwanted) in [
             (Mode::Usb, 1000.0, -1000.0),
             (Mode::Lsb, -1000.0, 1000.0),
         ] {
-            let taps = filter_taps(mode, bw, fs, FIR_TAPS);
+            let taps = filter_taps(mode, bw, fs, CHAN_TAPS);
             let pass = response_db(&taps, want, fs);
             let reject = response_db(&taps, unwanted, fs);
             assert!(
