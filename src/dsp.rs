@@ -457,6 +457,52 @@ mod tests {
         fs / 2.0
     }
 
+    /// Kolik procesoru sežere samotný DSP řetězec. Užitečné při úvahách,
+    /// jestli to poběží i na slabším stroji.
+    #[test]
+    fn zmer_vykon_retezce() {
+        let fs = 96_000.0;
+        let secs = 10.0;
+        let n = (fs * secs) as usize;
+        let iq: Vec<Complex32> = (0..n)
+            .map(|i| {
+                let ph = 2.0 * PI * 10_000.0 * i as f64 / fs;
+                Complex32::new(ph.cos() as f32, ph.sin() as f32)
+            })
+            .collect();
+
+        println!("\nDSP řetězec, {secs} s signálu na 96 kHz:");
+        for (mode, bw, dec) in [
+            (Mode::Am, 8000.0, Decoder::Off),
+            (Mode::Cw, 500.0, Decoder::Off),
+            (Mode::Cw, 500.0, Decoder::Cw),
+            (Mode::Am, 8000.0, Decoder::Rtty),
+        ] {
+            let mut rx = Demod::new(fs, 2, bw, mode);
+            rx.set_offset(10_000.0);
+            rx.set_decoder(dec, RttyConfig::default(), 10.0);
+            let mut out = Vec::with_capacity(n / 2);
+
+            // Rozehřát cache, jinak první měření vyjde nesmyslně pomalé.
+            rx.process(&iq[..n / 10], &mut out);
+            out.clear();
+            let _ = rx.take_text();
+
+            let t0 = std::time::Instant::now();
+            rx.process(&iq, &mut out);
+            let el = t0.elapsed().as_secs_f64();
+            println!(
+                "  {:3} bw={:5.0} dek={:7}  {:.2} s CPU  ->  {:5.1}x realtime, {:4.1} % jádra",
+                mode.label(),
+                bw,
+                dec.label(),
+                el,
+                secs / el,
+                el / secs * 100.0
+            );
+        }
+    }
+
     #[test]
     fn zmer_uzke_filtry() {
         // Kanálový filtr běží na výstupní vzorkovačce, ne na vstupní.
