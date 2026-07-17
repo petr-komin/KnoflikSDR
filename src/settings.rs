@@ -375,6 +375,19 @@ mod tests {
         assert!(s.band_memory.is_empty());
     }
 
+    /// Se zavřenou konzolí nemá dekodér co dělat - text by nikdo neviděl
+    /// a squelch by se kreslil do spektra bez důvodu.
+    #[test]
+    fn volba_dekoderu_prezije_zavreni_konzole() {
+        let mut s = Settings::default();
+        s.decoder = Decoder::Cw;
+        s.show_console = false;
+        // Uložená volba zůstává, jen se podle ní zrovna nedekóduje.
+        let back: Settings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
+        assert_eq!(back.decoder, Decoder::Cw);
+        assert!(!back.show_console);
+    }
+
     #[test]
     fn config_bez_stanic_da_prazdny_seznam() {
         // Configy z verze před oblíbenými nesmí po přidání seznamu spadnout.

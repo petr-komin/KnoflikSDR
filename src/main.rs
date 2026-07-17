@@ -169,6 +169,16 @@ impl App {
         self.set.bandwidth()
     }
 
+    /// Dekodér, který má opravdu běžet. Se zavřenou konzolí žádný -
+    /// jinak by počítal text, který stejně nikdo neuvidí.
+    fn active_decoder(&self) -> decode::Decoder {
+        if self.set.show_console {
+            self.set.decoder
+        } else {
+            decode::Decoder::Off
+        }
+    }
+
     fn set_bandwidth_hz(&mut self, bw: f64) {
         let (min, max) = radio::bandwidth_range(self.set.mode);
         self.set.set_bandwidth(bw.clamp(min, max));
@@ -346,7 +356,7 @@ impl App {
         c.swap_iq = self.set.swap_iq;
         c.bandwidth_hz = self.bandwidth_hz();
         c.mode = self.set.mode;
-        c.decoder = self.set.decoder;
+        c.decoder = self.active_decoder();
         c.rtty = decode::RttyConfig {
             reverse: self.set.rtty_reverse,
             ..Default::default()
@@ -1167,7 +1177,8 @@ impl eframe::App for App {
             );
 
             // Squelch CW: nad touhle čárou signál dekodér otevře.
-            if self.set.decoder == decode::Decoder::Cw {
+            // Jen když squelch opravdu něco dělá.
+            if self.active_decoder() == decode::Decoder::Cw {
                 if let Some(thr) = squelch_line_db(
                     &bins,
                     span_hz,
