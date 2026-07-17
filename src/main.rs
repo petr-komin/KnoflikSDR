@@ -599,11 +599,11 @@ impl App {
                             ui.spacing_mut().item_spacing.y = 0.0;
                             ui.label(&e.station);
                             if !podtitul.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(podtitul.join(" · "))
-                                        .weak()
-                                        .size(10.0),
-                                );
+                                // Záměrně bez .weak() - to je jen běžná barva
+                                // vynásobená alfou a na malém písmu se ztrácí.
+                                // Země a jazyk jsou přitom to hlavní, proč tu
+                                // ta sekce je. Hierarchii drží velikost.
+                                ui.label(egui::RichText::new(podtitul.join(" · ")).size(11.0));
                             }
                         })
                         .response
