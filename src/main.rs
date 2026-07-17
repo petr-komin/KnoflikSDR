@@ -765,6 +765,30 @@ impl App {
     }
 }
 
+/// Úroveň v dB, nad kterou signál otevře CW squelch - k zakreslení do spektra.
+///
+/// Není to prosté „šum + squelch". Dekodér počítá odstup v šířce svého
+/// kanálového filtru, kdežto spektrum ukazuje úroveň na jeden bin FFT.
+/// Šumu je v širším filtru víc, takže je potřeba přepočet `10*log10(bw/bin)`;
+/// bez něj by čára ležela u 500Hz filtru asi o 10 dB níž, než odpovídá
+/// skutečnosti, a slibovala by dekódování signálů, které squelch neotevřou.
+///
+/// Šumové dno se odhaduje mediánem binů - ten je odolný vůči několika
+/// silným stanicím v okně.
+fn squelch_line_db(bins: &[f32], span_hz: f64, bandwidth_hz: f64, squelch_db: f32) -> Option<f32> {
+    if bins.len() < 16 {
+        return None;
+    }
+    let mut sorted = bins.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let noise_db = sorted[sorted.len() / 2];
+
+    // Šumová šířka jednoho binu; 1.5 je činitel Hannova okna.
+    let bin_bw = span_hz / bins.len() as f64 * 1.5;
+    let correction = 10.0 * (bandwidth_hz / bin_bw).max(1.0).log10();
+    Some(noise_db + squelch_db + correction as f32)
+}
+
 /// Viditelný výřez panoramatu: (střed v Hz od VFO, šířka v Hz).
 ///
 /// Výřez se drží naladěné stanice, ale zastaví se u kraje zachyceného
@@ -1142,6 +1166,34 @@ impl eframe::App for App {
                 egui::Color32::from_rgba_unmultiplied(90, 160, 255, 40),
             );
 
+            // Squelch CW: nad touhle čárou signál dekodér otevře.
+            if self.set.decoder == decode::Decoder::Cw {
+                if let Some(thr) = squelch_line_db(
+                    &bins,
+                    span_hz,
+                    self.bandwidth_hz(),
+                    self.set.cw_squelch_db,
+                ) {
+                    let t = ((thr - self.set.db_min) / (self.set.db_max - self.set.db_min))
+                        .clamp(0.0, 1.0);
+                    let y = rect.bottom() - rect.height() * t;
+                    painter.line_segment(
+                        [
+                            egui::pos2(bw_rect.left(), y),
+                            egui::pos2(bw_rect.right(), y),
+                        ],
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 210, 60)),
+                    );
+                    painter.text(
+                        egui::pos2(bw_rect.right() - 2.0, y - 1.0),
+                        egui::Align2::RIGHT_BOTTOM,
+                        "squelch",
+                        egui::FontId::proportional(9.0),
+                        egui::Color32::from_rgb(255, 210, 60),
+                    );
+                }
+            }
+
             // Kreslíme jen biny uvnitř výřezu - jinak by se při zoomu počítaly
             // tisíce bodů mimo obrazovku.
             let n = bins.len().max(2);
@@ -1336,6 +1388,42 @@ mod tests {
             bins[idx] = db;
         }
         bins
+    }
+
+    /// Čára squelche musí ležet nad šumem přesně o práh plus přepočet
+    /// na šířku filtru - jinak by slibovala dekódování tam, kde se mlčí.
+    #[test]
+    fn cara_squelche_sedi_nad_sumem() {
+        let bins = vec![-110.0f32; FFT_SIZE];
+        // Bin má při 96 kHz a 2048 binech šumovou šířku 47*1.5 = 70 Hz.
+        // Filtr 700 Hz je tedy 10x širší -> korekce +10 dB.
+        let thr = squelch_line_db(&bins, SPAN, 703.125, 10.0).unwrap();
+        assert!(
+            (thr - (-110.0 + 10.0 + 10.0)).abs() < 0.5,
+            "čára na {thr} dB, čekáno -90 dB (šum -110, squelch 10, korekce 10)"
+        );
+    }
+
+    #[test]
+    fn cara_squelche_reaguje_na_prah_i_sirku() {
+        let bins = vec![-100.0f32; FFT_SIZE];
+        let a = squelch_line_db(&bins, SPAN, 500.0, 10.0).unwrap();
+        let b = squelch_line_db(&bins, SPAN, 500.0, 20.0).unwrap();
+        assert!((b - a - 10.0).abs() < 0.01, "zvýšení prahu o 10 dB má čáru zvednout o 10");
+        // Dvojnásobná šířka filtru = dvojnásobek šumu = o 3 dB výš.
+        let c = squelch_line_db(&bins, SPAN, 1000.0, 10.0).unwrap();
+        assert!((c - a - 3.0).abs() < 0.1, "dvojnásobná šířka má čáru zvednout o ~3 dB");
+    }
+
+    /// Silné stanice v okně nesmí odhad šumu vytáhnout nahoru.
+    #[test]
+    fn odhad_sumu_odola_stanicim() {
+        let mut bins = vec![-110.0f32; FFT_SIZE];
+        for i in 0..FFT_SIZE / 4 {
+            bins[i] = -20.0;
+        }
+        let thr = squelch_line_db(&bins, SPAN, 500.0, 10.0).unwrap();
+        assert!(thr < -80.0, "medián se nechal vytáhnout stanicemi: {thr} dB");
     }
 
     #[test]
