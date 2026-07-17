@@ -3,6 +3,7 @@
 //! Zápis je odložený o `SAVE_DELAY` od poslední změny, aby tažení posuvníku
 //! nepsalo na disk každý snímek.
 
+use crate::audio::{self, Depth};
 use crate::decode::Decoder;
 use crate::dsp::Mode;
 use serde::{Deserialize, Serialize};
@@ -32,9 +33,23 @@ pub struct BandMemory {
     pub bandwidth_hz: f64,
 }
 
+/// Kalibrovaný krystal Si570. Kus od kusu se liší, proto je to v nastavení -
+/// špatná hodnota posune celou stupnici.
+pub const SI570_XTAL_HZ: f64 = 114_269_790.0;
+pub const SI570_I2C_ADDR: u16 = 0x55;
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Settings {
+    /// Zvukovka s I/Q ze SoftRocku. Na ALSA třeba "hw:CARD=HD,DEV=0",
+    /// u cpalu jméno zařízení nebo prázdno pro výchozí.
+    pub capture_device: String,
+    /// Kam jde demodulovaný zvuk.
+    pub playback_device: String,
+    /// Strop bitové hloubky vstupu.
+    pub depth: Depth,
+    pub si570_xtal_hz: f64,
+    pub si570_i2c_addr: u16,
     pub vfo_khz: f64,
     pub offset_hz: f64,
     pub mode: Mode,
@@ -68,6 +83,11 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            capture_device: audio::default_capture_device(),
+            playback_device: audio::default_playback_device(),
+            depth: Depth::Auto,
+            si570_xtal_hz: SI570_XTAL_HZ,
+            si570_i2c_addr: SI570_I2C_ADDR,
             vfo_khz: 7300.0,
             offset_hz: 0.0,
             mode: Mode::Am,
@@ -116,10 +136,19 @@ const APP_DIR: &str = "knoflik-sdr";
 /// nevznikne nový config - ať uživatel po přejmenování nepřijde o stanice.
 const LEGACY_APP_DIR: &str = "rd-sdr";
 
+/// Kam s configem. Na Windows neexistuje HOME ani XDG - bez téhle větve
+/// by se nastavení tiše neuložilo.
 fn config_base() -> Option<PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    }
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -253,6 +282,11 @@ mod tests {
     #[test]
     fn ulozeni_a_nacteni_zachova_hodnoty() {
         let s = Settings {
+            capture_device: "hw:CARD=HD,DEV=0".into(),
+            playback_device: "pulse".into(),
+            depth: Depth::Bits16,
+            si570_xtal_hz: 114_252_000.0,
+            si570_i2c_addr: 0x50,
             vfo_khz: 5900.0,
             offset_hz: -12_000.0,
             mode: Mode::Lsb,
@@ -386,6 +420,17 @@ mod tests {
         let back: Settings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
         assert_eq!(back.decoder, Decoder::Cw);
         assert!(!back.show_console);
+    }
+
+    /// Config z verze, kde bylo zvukové zařízení natvrdo ve zdrojáku,
+    /// nesmí po přidání voleb spadnout - doplní se výchozí.
+    #[test]
+    fn config_bez_zvukovych_voleb_da_vychozi() {
+        let s: Settings = toml::from_str("vfo_khz = 7300.0").unwrap();
+        assert_eq!(s.depth, Depth::Auto);
+        assert_eq!(s.capture_device, audio::default_capture_device());
+        assert_eq!(s.si570_xtal_hz, SI570_XTAL_HZ);
+        assert_eq!(s.si570_i2c_addr, SI570_I2C_ADDR);
     }
 
     #[test]

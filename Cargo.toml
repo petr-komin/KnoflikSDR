@@ -10,7 +10,6 @@ keywords = ["sdr", "softrock", "si570", "ham-radio", "dsp"]
 categories = ["science", "multimedia::audio"]
 
 [dependencies]
-alsa = "0.11"
 anyhow = "1.0.103"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 # Záměrně glow (OpenGL) místo výchozího wgpu. wgpu na Linuxu chce Vulkan,
@@ -31,3 +30,13 @@ rustfft = "6.4.1"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.3"
 ureq = "3.3.0"
+
+# Zvuk je jediné, co se mezi systémy liší. Na Linuxu jdeme na ALSA napřímo -
+# jen tak se dostaneme na packed 24 bit (S243LE), což je na dynamickém rozsahu
+# panoramatu znát. Jinde to jede přes cpal (WASAPI / CoreAudio), kde o formát
+# rozhoduje zvukový server a hloubka bývá menší.
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.11"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+cpal = "0.18"

@@ -430,18 +430,26 @@ pub fn current_season() -> String {
     }
 }
 
+/// Kam s cache. Na Windows neexistuje HOME ani XDG.
+fn cache_base() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+    }
+}
+
 fn cache_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("knoflik-sdr"))
+    Some(cache_base()?.join("knoflik-sdr"))
 }
 
 fn cache_path(season: &str) -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("knoflik-sdr").join(format!("eibi-{season}.csv")))
+    Some(cache_dir()?.join(format!("eibi-{season}.csv")))
 }
 
 /// EiBi posílá CSV v Latin-1, ne v UTF-8 - jsou v něm jména jako

@@ -20,12 +20,6 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-/// Zvuková karta s I/Q ze SoftRocku (z ~/.quisk_conf.py).
-const CAPTURE_DEVICE: &str = "hw:CARD=HD,DEV=0";
-/// Kalibrovaný krystal Si570.
-const SI570_XTAL: f64 = 114_269_790.0;
-const SI570_I2C_ADDR: u16 = 0x55;
-
 const WF_HEIGHT: usize = 256;
 /// Výška pruhu s frekvenční osou pod spektrem.
 const AXIS_H: f32 = 16.0;
@@ -53,12 +47,25 @@ enum ScheduleState {
 fn main() -> eframe::Result {
     let shared = Arc::new(Shared::new());
 
+    // Nastavení nese i zvuková zařízení, takže ho potřebujeme před vlákny.
+    let saved = Settings::load();
+
     // Audio ring: ~0.5 s rezerva na 48 kHz.
     let (audio_tx, audio_rx) = rtrb::RingBuffer::<f32>::new(24_000);
 
-    audio::spawn(audio_rx, radio::AUDIO_RATE as u32, shared.running.clone());
-    radio::spawn(CAPTURE_DEVICE.to_string(), shared.clone(), audio_tx);
-    let tuner = spawn_tuner(shared.clone());
+    audio::spawn(
+        audio_rx,
+        saved.playback_device.clone(),
+        radio::AUDIO_RATE as u32,
+        shared.running.clone(),
+    );
+    radio::spawn(
+        saved.capture_device.clone(),
+        saved.depth,
+        shared.clone(),
+        audio_tx,
+    );
+    let tuner = spawn_tuner(shared.clone(), saved.si570_xtal_hz, saved.si570_i2c_addr);
 
     // Diagnostika bez GUI: ukáže, co si capture vyjednal a jestli teče signál.
     if std::env::args().any(|a| a == "--probe") {
@@ -67,8 +74,6 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
-    // Nastavení potřebujeme už tady, abychom okno otevřeli v poslední velikosti.
-    let saved = Settings::load();
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([saved.window_w, saved.window_h]),
@@ -121,10 +126,10 @@ fn spawn_schedule_load() -> Arc<std::sync::Mutex<ScheduleState>> {
 
 /// Ladicí vlákno. USB control transfer trvá jednotky ms, takže nesmí
 /// běžet v GUI ani v audio cestě.
-fn spawn_tuner(shared: Arc<Shared>) -> mpsc::Sender<f64> {
+fn spawn_tuner(shared: Arc<Shared>, xtal_hz: f64, i2c_addr: u16) -> mpsc::Sender<f64> {
     let (tx, rx) = mpsc::channel::<f64>();
     std::thread::spawn(move || {
-        let mut si = match si570::Si570::open(SI570_XTAL, SI570_I2C_ADDR) {
+        let mut si = match si570::Si570::open(xtal_hz, i2c_addr) {
             Ok(mut s) => {
                 let ver = s.version().unwrap_or_else(|_| "?".into());
                 *shared.hw_status.lock().unwrap() = format!("SoftRock fw {ver}");
@@ -144,6 +149,44 @@ fn spawn_tuner(shared: Arc<Shared>) -> mpsc::Sender<f64> {
     tx
 }
 
+/// Výčet zvukových zařízení pro nastavení.
+struct Devices {
+    capture: Vec<audio::DeviceInfo>,
+    playback: Vec<audio::DeviceInfo>,
+}
+
+impl Devices {
+    fn enumerate() -> Self {
+        Devices {
+            capture: audio::list_capture(),
+            playback: audio::list_playback(),
+        }
+    }
+}
+
+/// To z nastavení, co se čte jen při startu vláken. Změna se projeví
+/// až po restartu, tak ať to umíme uživateli říct.
+#[derive(PartialEq, Clone)]
+struct StartupConfig {
+    capture_device: String,
+    playback_device: String,
+    depth: audio::Depth,
+    si570_xtal_hz: f64,
+    si570_i2c_addr: u16,
+}
+
+impl StartupConfig {
+    fn of(s: &Settings) -> Self {
+        StartupConfig {
+            capture_device: s.capture_device.clone(),
+            playback_device: s.playback_device.clone(),
+            depth: s.depth,
+            si570_xtal_hz: s.si570_xtal_hz,
+            si570_i2c_addr: s.si570_i2c_addr,
+        }
+    }
+}
+
 struct App {
     shared: Arc<Shared>,
     tuner: mpsc::Sender<f64>,
@@ -154,6 +197,14 @@ struct App {
     drag_bw: bool,
     /// Je otevřené okno správy oblíbených? Neukládá se.
     show_manage: bool,
+    /// Je otevřené okno nastavení? Neukládá se.
+    show_options: bool,
+    /// Zvuková zařízení. Výčet je pomalý (ALSA otvírá karty), takže se
+    /// dělá jen při otevření nastavení, ne každý snímek.
+    devices: Option<Devices>,
+    /// Nastavení, se kterým se program nastartoval - podle něj poznáme,
+    /// že se zvuk nebo Si570 změnily a je potřeba restart.
+    startup: StartupConfig,
     /// Po skoku za roh se má doladit na nejsilnější stanici, ale až se
     /// panorama ustálí - proto až po tomto čase.
     snap_at: Option<std::time::Instant>,
@@ -184,6 +235,9 @@ impl App {
             vfo_input: format!("{:.1}", s.vfo_khz),
             drag_bw: false,
             show_manage: false,
+            show_options: false,
+            devices: None,
+            startup: StartupConfig::of(&s),
             snap_at: None,
             console: String::new(),
             schedule: spawn_schedule_load(),
@@ -726,6 +780,175 @@ impl App {
             });
     }
 
+    /// Rozbalovací seznam zvukových zařízení. Necháváme i ruční zápis -
+    /// výčet nemusí trefit všechno, co ALSA umí otevřít.
+    fn device_picker(
+        ui: &mut egui::Ui,
+        id: &str,
+        current: &mut String,
+        list: &[audio::DeviceInfo],
+    ) {
+        let shown = list
+            .iter()
+            .find(|d| &d.id == current)
+            .map_or_else(|| current.clone(), |d| d.label.clone());
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(shown)
+            .width(320.0)
+            .show_ui(ui, |ui| {
+                for d in list {
+                    ui.selectable_value(current, d.id.clone(), &d.label);
+                }
+            });
+        ui.add(egui::TextEdit::singleline(current).desired_width(180.0))
+            .on_hover_text("název zařízení lze zapsat i ručně");
+    }
+
+    /// Okno nastavení: zvuk a SoftRock. Všechno tady se čte při startu vláken,
+    /// takže se změny projeví až po restartu - a okno to říká nahlas.
+    fn options_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_options;
+        egui::Window::new("Nastavení")
+            .open(&mut open)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                let devices = self
+                    .devices
+                    .get_or_insert_with(Devices::enumerate);
+
+                ui.heading("Zvuk");
+                ui.label(
+                    egui::RichText::new(format!(
+                        "zvuková vrstva: {}",
+                        audio::backend_name()
+                    ))
+                    .weak(),
+                );
+                ui.add_space(4.0);
+
+                egui::Grid::new("zvuk_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("vstup (I/Q):");
+                        ui.horizontal(|ui| {
+                            Self::device_picker(
+                                ui,
+                                "vstup",
+                                &mut self.set.capture_device,
+                                &devices.capture,
+                            );
+                        });
+                        ui.end_row();
+
+                        ui.label("výstup:");
+                        ui.horizontal(|ui| {
+                            Self::device_picker(
+                                ui,
+                                "vystup",
+                                &mut self.set.playback_device,
+                                &devices.playback,
+                            );
+                        });
+                        ui.end_row();
+
+                        ui.label("hloubka:");
+                        ui.horizontal(|ui| {
+                            for d in audio::Depth::ALL {
+                                ui.selectable_value(&mut self.set.depth, d, d.label());
+                            }
+                            ui.label(
+                                egui::RichText::new(format!("→ {}", self.set.depth.hint()))
+                                    .weak(),
+                            );
+                        });
+                        ui.end_row();
+                    });
+                ui.label(
+                    egui::RichText::new(
+                        "24 bit umí jen ALSA na Linuxu. Přes WASAPI a CoreAudio \
+                         o formátu rozhoduje zvukový server, tam automatika cílí na 16 bit.",
+                    )
+                    .weak()
+                    .small(),
+                );
+
+                if ui.button("↻ znovu prohledat zařízení").clicked() {
+                    self.devices = None;
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.heading("SoftRock");
+                egui::Grid::new("sr_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("krystal Si570 [Hz]:");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.set.si570_xtal_hz)
+                                    .speed(1.0)
+                                    .range(100_000_000.0..=130_000_000.0),
+                            );
+                            if ui.button("výchozí").clicked() {
+                                self.set.si570_xtal_hz = settings::SI570_XTAL_HZ;
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label("adresa I2C:");
+                        ui.horizontal(|ui| {
+                            let mut addr = self.set.si570_i2c_addr as u32;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut addr)
+                                        .speed(1.0)
+                                        .range(0..=127)
+                                        .hexadecimal(2, false, true),
+                                )
+                                .changed()
+                            {
+                                self.set.si570_i2c_addr = addr as u16;
+                            }
+                            ui.label(
+                                egui::RichText::new("obvykle 0x55, u některých kusů 0x50")
+                                    .weak()
+                                    .small(),
+                            );
+                        });
+                        ui.end_row();
+                    });
+                ui.label(
+                    egui::RichText::new(
+                        "Krystal je kalibrace kus od kusu - špatná hodnota posune celou stupnici.",
+                    )
+                    .weak()
+                    .small(),
+                );
+
+                ui.add_space(8.0);
+                ui.separator();
+                if StartupConfig::of(&self.set) != self.startup {
+                    ui.label(
+                        egui::RichText::new(
+                            "⚠ Zvuk i Si570 se čtou při startu - změny se projeví \
+                             až po restartu programu.",
+                        )
+                        .color(egui::Color32::from_rgb(230, 180, 80)),
+                    );
+                }
+                if let Some(p) = settings::config_path() {
+                    ui.label(
+                        egui::RichText::new(format!("config: {}", p.display()))
+                            .weak()
+                            .small(),
+                    );
+                }
+            });
+        self.show_options = open;
+    }
+
     /// Okno pro správu oblíbených - přejmenování, úpravy, pořadí, mazání.
     fn manage_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_manage;
@@ -1152,6 +1375,13 @@ impl eframe::App for App {
                     .on_hover_text("podbarvení úseků pásem (IARU R1)");
                 ui.checkbox(&mut self.set.show_console, "konzole")
                     .on_hover_text("dekódovaný text z RTTY a CW");
+                if ui
+                    .button("⚙ nastavení")
+                    .on_hover_text("zvuková zařízení, bitová hloubka, Si570")
+                    .clicked()
+                {
+                    self.show_options = !self.show_options;
+                }
                 ui.separator();
                 let (bw_min, bw_max) = radio::bandwidth_range(self.set.mode);
                 let mut bw_khz = self.bandwidth_hz() / 1000.0;
@@ -1203,6 +1433,7 @@ impl eframe::App for App {
 
         self.favourites_panel(ui);
         self.manage_window(&ctx);
+        self.options_window(&ctx);
         // Konzole až po stavovém řádku, ať sedí nad ním.
         if self.set.show_console {
             self.console_panel(ui);

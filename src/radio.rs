@@ -1,10 +1,12 @@
-//! Vlákno příjmu: ALSA capture -> DSP -> audio ring + spektrum pro GUI.
+//! Vlákno příjmu: zvukový vstup -> DSP -> audio ring + spektrum pro GUI.
+//!
+//! O to, odkud se vzorky berou a v jakém formátu jsou na drátě, se stará
+//! [`crate::audio`]; sem už chodí hotové f32.
 
+use crate::audio::{self, Depth};
 use crate::decode::{Decoder, RttyConfig};
 use crate::dsp::{Demod, Mode};
-use alsa::pcm::{Access, Format, HwParams, PCM};
-use alsa::{Direction, ValueOr};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use num_complex::Complex32;
 use rustfft::FftPlanner;
 use std::f32::consts::PI;
@@ -41,17 +43,6 @@ pub fn bandwidth_range(mode: Mode) -> (f64, f64) {
 pub const CW_MIN_BANDWIDTH_HZ: f64 = 150.0;
 /// Výchozí šířka pro CW - obvyklá volba pro běžný provoz.
 pub const CW_BANDWIDTH_HZ: f64 = 500.0;
-
-/// Co zkusit na vstupu, od nejlepšího. Vyšší vzorkovačka = širší panorama,
-/// 24 bit = větší dynamický rozsah.
-const CANDIDATES: &[(u32, Format)] = &[
-    (192_000, Format::S243LE),
-    (192_000, Format::S16LE),
-    (96_000, Format::S243LE),
-    (96_000, Format::S16LE),
-    (48_000, Format::S243LE),
-    (48_000, Format::S16LE),
-];
 
 /// Ovládací prvky, do kterých píše GUI a čte je DSP vlákno.
 pub struct Controls {
@@ -141,59 +132,22 @@ impl Shared {
     }
 }
 
-/// Dekóduje jeden vzorek z ALSA bufferu na f32 v rozsahu -1..1.
-#[inline]
-fn decode(fmt: Format, b: &[u8]) -> f32 {
-    match fmt {
-        Format::S16LE => i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0,
-        Format::S243LE => {
-            // 3 bajty LE; posunem nahoru a aritmetickým posunem zpět
-            // se správně rozšíří znaménko.
-            let v = ((b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16)) << 8;
-            (v >> 8) as f32 / 8_388_608.0
-        }
-        _ => 0.0,
-    }
-}
-
-fn bytes_per_sample(fmt: Format) -> usize {
-    match fmt {
-        Format::S16LE => 2,
-        Format::S243LE => 3,
-        _ => 0,
-    }
-}
-
-/// Zjistí nejlepší kombinaci vzorkovačky a formátu, kterou karta umí.
-fn negotiate(pcm: &PCM) -> Result<(u32, Format)> {
-    for &(rate, fmt) in CANDIDATES {
-        let hwp = HwParams::any(pcm)?;
-        if hwp.set_channels(2).is_err()
-            || hwp.set_access(Access::RWInterleaved).is_err()
-            || hwp.set_format(fmt).is_err()
-            || hwp.test_rate(rate).is_err()
-        {
-            continue;
-        }
-        return Ok((rate, fmt));
-    }
-    Err(anyhow!(
-        "zvukovka neumí žádnou podporovanou kombinaci (zkoušel jsem 192/96/48 kHz, 24 i 16 bit)"
-    ))
-}
+/// Kolik rámců si říct od vstupu najednou.
+const READ_FRAMES: usize = 1024;
 
 pub fn spawn(
     device: String,
+    depth: Depth,
     shared: Arc<Shared>,
     audio_tx: rtrb::Producer<f32>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut audio_tx = audio_tx;
         while shared.running.load(Ordering::Relaxed) {
-            match run(&device, &shared, &mut audio_tx) {
+            match run(&device, depth, &shared, &mut audio_tx) {
                 Ok(()) => break,
                 Err(e) => {
-                    *shared.status.lock().unwrap() = format!("chyba capture: {e}");
+                    *shared.status.lock().unwrap() = format!("chyba vstupu: {e}");
                     std::thread::sleep(Duration::from_secs(2));
                 }
             }
@@ -201,41 +155,35 @@ pub fn spawn(
     })
 }
 
-fn run(device: &str, shared: &Arc<Shared>, audio_tx: &mut rtrb::Producer<f32>) -> Result<()> {
-    let pcm = PCM::new(device, Direction::Capture, false)?;
-    let (rate, fmt) = negotiate(&pcm)?;
-    {
-        let hwp = HwParams::any(&pcm)?;
-        hwp.set_channels(2)?;
-        hwp.set_access(Access::RWInterleaved)?;
-        hwp.set_format(fmt)?;
-        hwp.set_rate(rate, ValueOr::Nearest)?;
-        hwp.set_period_size_near(1024, ValueOr::Nearest)?;
-        hwp.set_buffer_size_near(8192)?;
-        pcm.hw_params(&hwp)?;
-    }
-    pcm.prepare()?;
+fn run(
+    device: &str,
+    depth: Depth,
+    shared: &Arc<Shared>,
+    audio_tx: &mut rtrb::Producer<f32>,
+) -> Result<()> {
+    let mut cap = audio::open_capture(device, depth)?;
+    let neg = cap.negotiated();
+    let actual_rate = neg.rate as f64;
+    shared.sample_rate.store(neg.rate, Ordering::Relaxed);
 
-    let actual_rate = pcm.hw_params_current()?.get_rate()? as f64;
-    shared
-        .sample_rate
-        .store(actual_rate as u32, Ordering::Relaxed);
-
-    let bits = bytes_per_sample(fmt) * 8;
+    // Prázdný název znamená u cpalu výchozí zařízení systému.
+    let kde = if device.is_empty() {
+        "výchozího zařízení".to_string()
+    } else {
+        device.to_string()
+    };
     *shared.status.lock().unwrap() = format!(
-        "příjem z {device} @ {:.0} kHz, {fmt} ({} bit)",
+        "příjem z {kde} @ {:.0} kHz, {} bit ({})",
         actual_rate / 1000.0,
-        if bits == 24 { 24 } else { 16 }
+        neg.bits,
+        audio::backend_name()
     );
 
     // Decimace na ~48 kHz audio.
     let decim = ((actual_rate / AUDIO_RATE).round() as usize).max(1);
 
     let mut rx = Demod::new(actual_rate, decim, AM_BANDWIDTH_HZ, Mode::Am);
-    let bps = bytes_per_sample(fmt);
-    let frame_bytes = bps * 2;
-    let io = pcm.io_bytes();
-    let mut raw = vec![0u8; 1024 * frame_bytes];
+    let mut raw = vec![0f32; READ_FRAMES * 2];
 
     let mut audio: Vec<f32> = Vec::with_capacity(1024);
     let mut iq: Vec<Complex32> = Vec::with_capacity(1024);
@@ -251,13 +199,8 @@ fn run(device: &str, shared: &Arc<Shared>, audio_tx: &mut rtrb::Producer<f32>) -
     let mut generation = 0u64;
 
     while shared.running.load(Ordering::Relaxed) {
-        let frames = match io.readi(&mut raw) {
-            Ok(n) => n,
-            Err(e) => {
-                pcm.try_recover(e, true)?;
-                continue;
-            }
-        };
+        // Nula znamená, že se vstup po zádrhelu zotavil a data přijdou příště.
+        let frames = cap.read(&mut raw)?;
         if frames == 0 {
             continue;
         }
@@ -282,9 +225,7 @@ fn run(device: &str, shared: &Arc<Shared>, audio_tx: &mut rtrb::Producer<f32>) -
 
         iq.clear();
         for f in 0..frames {
-            let o = f * frame_bytes;
-            let a = decode(fmt, &raw[o..o + bps]);
-            let b = decode(fmt, &raw[o + bps..o + frame_bytes]);
+            let (a, b) = (raw[f * 2], raw[f * 2 + 1]);
             iq.push(if swap {
                 Complex32::new(b, a)
             } else {
@@ -347,28 +288,4 @@ fn run(device: &str, shared: &Arc<Shared>, audio_tx: &mut rtrb::Producer<f32>) -
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dekoduje_s16() {
-        assert_eq!(decode(Format::S16LE, &[0x00, 0x00]), 0.0);
-        assert_eq!(decode(Format::S16LE, &0i16.to_le_bytes()), 0.0);
-        assert!((decode(Format::S16LE, &i16::MAX.to_le_bytes()) - 1.0).abs() < 1e-4);
-        assert!((decode(Format::S16LE, &i16::MIN.to_le_bytes()) + 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn dekoduje_s24_vcetne_znamenka() {
-        assert_eq!(decode(Format::S243LE, &[0, 0, 0]), 0.0);
-        // +8388607 = 0x7FFFFF -> těsně pod 1.0
-        assert!((decode(Format::S243LE, &[0xFF, 0xFF, 0x7F]) - 1.0).abs() < 1e-6);
-        // -8388608 = 0x800000 -> přesně -1.0
-        assert!((decode(Format::S243LE, &[0x00, 0x00, 0x80]) + 1.0).abs() < 1e-9);
-        // -1 = 0xFFFFFF
-        assert!(decode(Format::S243LE, &[0xFF, 0xFF, 0xFF]) < 0.0);
-    }
 }

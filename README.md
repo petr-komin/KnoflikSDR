@@ -21,6 +21,7 @@ jeden statický binár místo Pythonu s C rozšířením.
   má na naladěné frekvenci právě teď být
 - **Vyznačená mrtvá zóna** kolem VFO, kde má SoftRock DC spur
 - **Doladění na nejsilnější stanici** po skoku o celé okno
+- **Nastavení v okně** — zvuková zařízení, bitová hloubka i kalibrace Si570
 - Nastavení se ukládá průběžně do `~/.config/knoflik-sdr/config.toml`
 
 ## Hardware
@@ -28,12 +29,12 @@ jeden statický binár místo Pythonu s C rozšířením.
 Vyvíjeno na **SoftRock RX Ensemble II** se Si570 (USB VID:PID `16c0:05dc`, firmware DG8SAQ)
 a zvukovkou Creative Sound Blaster HD na 96 kHz.
 
-Zvukovku i formát si program **vyjedná sám** — zkouší 192/96/48 kHz a v každé rychlosti
+Formát si program **vyjedná sám** — zkouší 192/96/48 kHz a v každé rychlosti
 nejdřív 24 bit, pak 16.
 
 ## Sestavení
 
-Potřebuješ Rust a vývojové balíčky ALSA a libusb:
+Potřebuješ Rust a vývojové balíčky libusb; na Linuxu navíc ALSA:
 
 ```bash
 sudo apt install libasound2-dev libusb-1.0-0-dev
@@ -49,19 +50,31 @@ Diagnostika bez GUI — ukáže, co si vyjednal vstup a jestli teče signál:
 
 ## Nastavení
 
-Zvuková karta, kalibrace krystalu Si570 a I2C adresa jsou zatím konstanty na začátku
-`src/main.rs`:
-
-```rust
-const CAPTURE_DEVICE: &str = "hw:CARD=HD,DEV=0";
-const SI570_XTAL: f64 = 114_269_790.0;
-const SI570_I2C_ADDR: u16 = 0x55;
-```
+Tlačítko **⚙ nastavení** v liště otevře okno, kde se vybírá zvuková karta se vstupem I/Q,
+výstupní zařízení, strop bitové hloubky a kalibrace Si570. Zvuk a Si570 se čtou při startu,
+takže se změny **projeví až po restartu** programu.
 
 Krystal je potřeba zkalibrovat pro každý kus zvlášť. Hodnotu můžeš převzít z `~/.quisk_conf.py`,
 pokud jsi předtím jel na Quisku.
 
 USB práva řeší na Debianu udev pravidlo z `libhamlib4`, root potřeba není.
+
+## Přenositelnost
+
+Zvuk je jediné, co se mezi systémy liší:
+
+| | vstup a výstup | hloubka na `automaticky` |
+|---|---|---|
+| **Linux** | ALSA napřímo | 24 bit (`S243LE`) |
+| **Windows** | cpal → WASAPI | 16 bit |
+| **macOS** | cpal → CoreAudio | 16 bit |
+
+Packed 24 bit umí spolehlivě jen ALSA. Jinde o formátu rozhoduje zvukový server, proto
+tam automatika cílí na 16 bit — v nastavení jde hloubka přepnout ručně, kdyby to karta
+zvládla. Zbytek (DSP, GUI přes OpenGL, ladění Si570 přes libusb) je stejný všude.
+
+Na Windows si libusb ovladač pro SoftRock musíš podstrčit přes [Zadig](https://zadig.akeo.ie/),
+jinak se rádio na USB nenajde.
 
 ## Rozpis stanic
 
