@@ -557,7 +557,7 @@ impl App {
                         }
                     };
                     for e in found.iter().take(6) {
-                        let tip = format!(
+                        let mut tip = format!(
                             "{:.0} kHz\n{:04}-{:04} UTC\nzemě: {}\njazyk: {}\ncíl: {}",
                             e.freq_khz,
                             e.start,
@@ -566,16 +566,43 @@ impl App {
                             explain(&e.language, sch.codes.language(&e.language)),
                             explain(&e.target, sch.codes.target(&e.target)),
                         );
+                        // Relay je pro identifikaci klíčový: odjinud se
+                        // signál šíří úplně jinak.
+                        if let Some(host) = e.relay_country() {
+                            tip.push_str(&format!(
+                                "\nvysíláno přes: {}",
+                                explain(host, sch.codes.country(host))
+                            ));
+                        }
+                        // Země a jazyk rovnou v seznamu: podle jazyka se
+                        // nejsnáz pozná, kterou z kandidátek zrovna slyšíš.
+                        let mut podtitul = Vec::new();
+                        if !e.country.is_empty() {
+                            podtitul
+                                .push(sch.codes.country(&e.country).unwrap_or(&e.country).to_string());
+                        }
+                        if !e.language.is_empty() {
+                            podtitul.push(
+                                sch.codes
+                                    .language_short(&e.language)
+                                    .unwrap_or(&e.language)
+                                    .to_string(),
+                            );
+                        }
+                        if let Some(host) = e.relay_country() {
+                            podtitul.push(format!(
+                                "přes {}",
+                                sch.codes.country(host).unwrap_or(host)
+                            ));
+                        }
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
                             ui.label(&e.station);
-                            if !e.country.is_empty() {
+                            if !podtitul.is_empty() {
                                 ui.label(
-                                    egui::RichText::new(
-                                        sch.codes.country(&e.country).unwrap_or(&e.country),
-                                    )
-                                    .weak()
-                                    .size(10.0),
+                                    egui::RichText::new(podtitul.join(" · "))
+                                        .weak()
+                                        .size(10.0),
                                 );
                             }
                         })

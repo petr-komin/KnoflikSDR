@@ -22,6 +22,12 @@ const DAY_NAMES: [&str; 7] = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DaySet(u8);
 
+impl Default for DaySet {
+    fn default() -> Self {
+        DaySet::ALL
+    }
+}
+
 impl DaySet {
     pub const ALL: DaySet = DaySet(0b111_1111);
 
@@ -39,6 +45,15 @@ impl DaySet {
         if s.is_empty() || s.eq_ignore_ascii_case("irr") {
             return DaySet::ALL;
         }
+        // Číselný zápis: "156" = pondělí, pátek, sobota (1 = pondělí).
+        if s.chars().all(|c| ('1'..='7').contains(&c)) {
+            let mut mask = 0u8;
+            for c in s.chars() {
+                mask |= 1 << (c as u8 - b'1');
+            }
+            return DaySet(mask);
+        }
+
         let mut mask = 0u8;
         for part in s.split(',') {
             let part = part.trim();
@@ -71,7 +86,7 @@ impl DaySet {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Entry {
     pub freq_khz: f64,
     /// Čas v UTC jako HHMM.
@@ -83,9 +98,49 @@ pub struct Entry {
     pub station: String,
     pub language: String,
     pub target: String,
+    /// Kód místa vysílače, platí v rámci země.
+    pub site: String,
+    /// Kód trvanlivosti záznamu. 6 = platí jen mezi `from_date` a `to_date`.
+    pub persistence: u8,
+    /// Platnost v části sezóny jako (měsíc, den) - jen když persistence = 6.
+    pub from_date: Option<(u32, u32)>,
+    pub to_date: Option<(u32, u32)>,
 }
 
 impl Entry {
+    /// Platí záznam k dnešnímu datu?
+    ///
+    /// Záznamy s persistence = 6 platí jen v části sezóny; EiBi u nich uvádí
+    /// rozsah dat. Bez téhle kontroly bychom ukazovali vysílání, které je
+    /// zrovna mimo svoje období.
+    pub fn active_on_date(&self, month: u32, day: u32) -> bool {
+        if self.persistence != 6 {
+            return true;
+        }
+        let (Some((m1, d1)), Some((m2, d2))) = (self.from_date, self.to_date) else {
+            return true;
+        };
+        let today = month * 100 + day;
+        let (a, b) = (m1 * 100 + d1, m2 * 100 + d2);
+        if a <= b {
+            today >= a && today <= b
+        } else {
+            // Rozsah přes konec roku.
+            today >= a || today <= b
+        }
+    }
+
+    /// Země, ze které se ve skutečnosti vysílá, pokud je jiná než domovská.
+    ///
+    /// EiBi značí cizí vysílač předponou `/ABC` s kódem hostitelské země:
+    /// `/OMA-a` znamená, že BBC jde přes vysílač v Ománu. Pro identifikaci
+    /// stanice to rozhoduje - odjinud se šíří signál úplně jinak.
+    pub fn relay_country(&self) -> Option<&str> {
+        let s = self.site.strip_prefix('/')?;
+        let end = s.find('-').unwrap_or(s.len());
+        if end == 0 { None } else { Some(&s[..end]) }
+    }
+
     /// Vysílá se v daný čas a den?
     pub fn active_at(&self, hhmm: u16, day: u8) -> bool {
         if !self.days.contains(day) {
@@ -120,6 +175,18 @@ impl Codes {
     }
     pub fn language(&self, code: &str) -> Option<&str> {
         self.languages.get(code).map(|s| s.as_str())
+    }
+
+    /// Jen holý název jazyka, bez výčtu zemí a počtu mluvčích.
+    ///
+    /// EiBi píše `English: UK (60m), USA (225m), India (200m), others`,
+    /// do seznamu se ale hodí jenom "English".
+    pub fn language_short(&self, code: &str) -> Option<&str> {
+        let full = self.languages.get(code)?;
+        let end = full
+            .find([':', '('])
+            .unwrap_or(full.len());
+        Some(full[..end].trim())
     }
     pub fn target(&self, code: &str) -> Option<&str> {
         self.targets.get(code).map(|s| s.as_str())
@@ -200,6 +267,22 @@ pub struct Schedule {
     pub codes: Codes,
 }
 
+/// Datum ve tvaru DDMM, jak ho píše EiBi ("2903" = 29. března).
+/// V poli stop bývá připojené datum posledního logu v hranatých závorkách.
+fn parse_ddmm(s: &str) -> Option<(u32, u32)> {
+    let s = s.trim();
+    let s = s.split('[').next()?.trim();
+    if s.len() != 4 {
+        return None;
+    }
+    let d: u32 = s[0..2].parse().ok()?;
+    let m: u32 = s[2..4].parse().ok()?;
+    if !(1..=31).contains(&d) || !(1..=12).contains(&m) {
+        return None;
+    }
+    Some((m, d))
+}
+
 fn parse_hhmm(s: &str) -> Option<u16> {
     let s = s.trim();
     if s.len() != 4 {
@@ -232,6 +315,14 @@ impl Schedule {
             let (Some(start), Some(end)) = (parse_hhmm(a), parse_hhmm(b)) else {
                 continue;
             };
+            let persistence = f
+                .get(8)
+                .and_then(|s| s.trim().parse::<u8>().ok())
+                .unwrap_or(0);
+            // EiBi tyhle záznamy sám nezařazuje do svých výpisů - nevysílá se.
+            if persistence == 8 {
+                continue;
+            }
             entries.push(Entry {
                 freq_khz: freq,
                 start,
@@ -241,6 +332,10 @@ impl Schedule {
                 station: f[4].trim().to_string(),
                 language: f[5].trim().to_string(),
                 target: f[6].trim().to_string(),
+                site: f.get(7).map(|s| s.trim().to_string()).unwrap_or_default(),
+                persistence,
+                from_date: f.get(9).and_then(|s| parse_ddmm(s)),
+                to_date: f.get(10).and_then(|s| parse_ddmm(s)),
             });
         }
         entries.sort_by(|a, b| a.freq_khz.partial_cmp(&b.freq_khz).unwrap());
@@ -259,10 +354,15 @@ impl Schedule {
         let now = Utc::now();
         let hhmm = (now.hour() * 100 + now.minute()) as u16;
         let day = weekday_index(now.weekday());
+        let (month, dom) = (now.month(), now.day());
         let mut v: Vec<&Entry> = self
             .entries
             .iter()
-            .filter(|e| (e.freq_khz - freq_khz).abs() <= tolerance_khz && e.active_at(hhmm, day))
+            .filter(|e| {
+                (e.freq_khz - freq_khz).abs() <= tolerance_khz
+                    && e.active_at(hhmm, day)
+                    && e.active_on_date(month, dom)
+            })
             .collect();
         // Nejbližší frekvenci napřed.
         v.sort_by(|a, b| {
@@ -476,10 +576,7 @@ mod tests {
             start: 1600,
             end: 1700,
             days: DaySet::ALL,
-            country: "CHN".into(),
-            station: "Test".into(),
-            language: "E".into(),
-            target: "SEA".into(),
+            ..Default::default()
         };
         assert!(e.active_at(1600, 0));
         assert!(e.active_at(1659, 0));
@@ -495,10 +592,7 @@ mod tests {
             start: 2100,
             end: 100,
             days: DaySet::ALL,
-            country: "X".into(),
-            station: "T".into(),
-            language: "".into(),
-            target: "".into(),
+            ..Default::default()
         };
         assert!(e.active_at(2300, 0), "23:00 spadá do 2100-0100");
         assert!(e.active_at(30, 0), "00:30 taky");
@@ -512,10 +606,7 @@ mod tests {
             start: 0,
             end: 2400,
             days: DaySet::parse("Su"),
-            country: "X".into(),
-            station: "T".into(),
-            language: "".into(),
-            target: "".into(),
+            ..Default::default()
         };
         assert!(e.active_at(1200, 6), "v neděli ano");
         assert!(!e.active_at(1200, 0), "v pondělí ne");
@@ -592,7 +683,15 @@ mod tests {
             let v = s.lookup(f, 2.0);
             println!("  {f:.0} kHz -> {} stanic teď na vysílání", v.len());
             for e in v.iter().take(3) {
-                println!("      {} ({}) {} {}-{}", e.station, e.country, e.language, e.start, e.end);
+                println!(
+                    "      {} | {} · {} | {}-{} | vysílač {}",
+                    e.station,
+                    s.codes.country(&e.country).unwrap_or("?"),
+                    s.codes.language_short(&e.language).unwrap_or("?"),
+                    e.start,
+                    e.end,
+                    if e.site.is_empty() { "?" } else { &e.site }
+                );
             }
         }
     }
@@ -611,6 +710,89 @@ mod tests {
         let sch = Schedule::parse(&format!("hlavicka\n{s}\n"), "a26");
         assert_eq!(sch.entries.len(), 1);
         assert_eq!(sch.entries[0].station, "Rádio Clube do Pará");
+    }
+
+    /// EiBi zapisuje dny i čísly: 1 = pondělí.
+    #[test]
+    fn ciselne_dny() {
+        let d = DaySet::parse("156");
+        assert!(d.contains(0), "1 = pondělí");
+        assert!(d.contains(4), "5 = pátek");
+        assert!(d.contains(5), "6 = sobota");
+        assert!(!d.contains(1) && !d.contains(6));
+    }
+
+    /// Persistence 8 znamená neaktivní záznam - EiBi ho sám do svých
+    /// výpisů nedává, takže se nesmí ukazovat ani u nás.
+    #[test]
+    fn neaktivni_zaznamy_se_zahodi() {
+        let csv = "h\n                   6060;1600-1700;;CHN;Aktivni;E;SEA;k;1;;\n                   6060;1600-1700;;CHN;Neaktivni;E;SEA;k;8;;\n";
+        let s = Schedule::parse(csv, "a26");
+        assert_eq!(s.entries.len(), 1);
+        assert_eq!(s.entries[0].station, "Aktivni");
+    }
+
+    #[test]
+    fn datum_ddmm() {
+        assert_eq!(parse_ddmm("2903"), Some((3, 29)), "29. března");
+        assert_eq!(parse_ddmm("0109"), Some((9, 1)), "1. září");
+        // V poli stop bývá připojené datum logu.
+        assert_eq!(parse_ddmm("2106[0626]"), Some((6, 21)));
+        assert_eq!(parse_ddmm(""), None);
+        assert_eq!(parse_ddmm("9999"), None, "99. měsíc neexistuje");
+    }
+
+    /// Záznam s persistence 6 platí jen mezi svými daty.
+    #[test]
+    fn cast_sezony_plati_jen_ve_svem_obdobi() {
+        let csv = "h\n6060;0000-2400;;X;Letni;E;Eu;k;6;0106;3108;\n";
+        let s = Schedule::parse(csv, "a26");
+        let e = &s.entries[0];
+        assert!(e.active_on_date(7, 15), "15. července je uvnitř 1.6.-31.8.");
+        assert!(!e.active_on_date(12, 1), "1. prosince ne");
+        assert!(e.active_on_date(6, 1), "hranice včetně");
+    }
+
+    #[test]
+    fn cast_sezony_pres_konec_roku() {
+        let csv = "h\n6060;0000-2400;;X;Zimni;E;Eu;k;6;0112;3101;\n";
+        let s = Schedule::parse(csv, "a26");
+        let e = &s.entries[0];
+        assert!(e.active_on_date(12, 15), "prosinec");
+        assert!(e.active_on_date(1, 15), "leden");
+        assert!(!e.active_on_date(7, 15), "červenec ne");
+    }
+
+    /// Bez persistence 6 se datumy neuplatňují, i kdyby tam byly.
+    #[test]
+    fn jina_persistence_datum_neresi() {
+        let csv = "h\n6060;0000-2400;;X;Stala;E;Eu;k;1;0106;3108;\n";
+        let s = Schedule::parse(csv, "a26");
+        assert!(s.entries[0].active_on_date(12, 1));
+    }
+
+    /// Vysílání z cizího vysílače se pozná podle předpony "/ABC".
+    #[test]
+    fn relay_pozna_hostitelskou_zemi() {
+        let mk = |site: &str| Entry {
+            site: site.into(),
+            ..Default::default()
+        };
+        assert_eq!(mk("/OMA-a").relay_country(), Some("OMA"), "BBC přes Omán");
+        assert_eq!(mk("/MDG").relay_country(), Some("MDG"), "i bez kódu místa");
+        assert_eq!(mk("/D-n").relay_country(), Some("D"));
+        // Domácí vysílač předponu nemá.
+        assert_eq!(mk("am").relay_country(), None);
+        assert_eq!(mk("").relay_country(), None);
+    }
+
+    #[test]
+    fn kratky_nazev_jazyka() {
+        let readme = "   I) Language codes.\n\n                         E     English: UK (60m), USA (225m)   [eng]\n                         A     Arabic (300m)                   [ara]\n                         -CW   Morse Station\n\n   II) Country codes.\n";
+        let c = Codes::parse(readme);
+        assert_eq!(c.language_short("E"), Some("English"), "výčet zemí pryč");
+        assert_eq!(c.language_short("A"), Some("Arabic"), "počet mluvčích pryč");
+        assert_eq!(c.language_short("-CW"), Some("Morse Station"));
     }
 
     #[test]
