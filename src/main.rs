@@ -505,12 +505,14 @@ impl App {
     }
 
     /// Naladí konkrétní frekvenci i s režimem a šířkou. VFO se posadí tak,
-    /// aby stanice padla mimo mrtvou zónu kolem DC.
+    /// aby stanice padla mimo mrtvou zónu kolem DC - u širokého kanálu (WFM)
+    /// mnohem dál než u úzkého, jinak by DC spur padl doprostřed kanálu.
     fn tune_to(&mut self, freq_khz: f64, mode: dsp::Mode, bandwidth_hz: f64) {
         self.set.mode = mode;
         self.set_bandwidth_hz(bandwidth_hz);
-        self.set_vfo(freq_khz - PARK_OFFSET_HZ / 1000.0);
-        self.set.offset_hz = PARK_OFFSET_HZ;
+        let park = park_offset(bandwidth_hz, self.span_hz());
+        self.set_vfo(freq_khz - park / 1000.0);
+        self.set.offset_hz = park;
         self.center_view_on_tuned();
         self.snap_at = None; // ruční volba má přednost před hledáním
     }
@@ -941,57 +943,11 @@ impl App {
                 ui.heading("Rádio");
                 ui.label(
                     egui::RichText::new(format!(
-                        "aktuálně: {} — přepíná se selectem v liště nahoře",
+                        "aktuálně: {} — rádio, zisk i vzorkovačka se ovládají v liště nahoře",
                         self.set.hardware.label()
                     ))
                     .weak(),
                 );
-
-                // Vzorkovačka RSP1: užší = menší panorama a míň zátěže. Jen
-                // hodnoty z nabídky, aby decimace vyšla celočíselně. Přepne hned.
-                if self.set.hardware == source::Hardware::Rsp1 {
-                    ui.horizontal(|ui| {
-                        ui.label("vzorkovačka:");
-                        let puvodni = self.set.rsp1_rate_hz;
-                        egui::ComboBox::from_id_salt("rsp1_rate")
-                            .selected_text(format!("{:.3} MHz", puvodni / 1e6))
-                            .show_ui(ui, |ui| {
-                                for &r in source::RSP1_RATES_HZ {
-                                    ui.selectable_value(
-                                        &mut self.set.rsp1_rate_hz,
-                                        r,
-                                        format!(
-                                            "{:.3} MHz  ·  panorama {:.0} kHz  ·  decim {}×",
-                                            r / 1e6,
-                                            r / 1000.0,
-                                            source::rsp1_decim(r)
-                                        ),
-                                    );
-                                }
-                            });
-                        if self.set.rsp1_rate_hz != puvodni {
-                            reopen = true;
-                        }
-                    });
-                }
-
-                // Zisk umí jen rádio, které ho hlásí; SoftRock ne.
-                let range = *self.shared.gain_range.lock().unwrap();
-                if let Some(g) = range {
-                    ui.horizontal(|ui| {
-                        ui.label("zisk [dB]:");
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut self.set.rsp1_gain_db, g.min..=g.max)
-                                    .fixed_decimals(1),
-                            )
-                            .changed()
-                        {
-                            // Zisk se na rozdíl od zbytku projeví hned, bez reopen.
-                            let _ = self.gain_tx.send(self.set.rsp1_gain_db);
-                        }
-                    });
-                }
 
                 ui.add_space(8.0);
                 ui.separator();
@@ -1428,6 +1384,22 @@ fn offset_after_vfo_step(offset_hz: f64, applied_khz: f64, span_hz: f64) -> f64 
     (offset_hz - applied_khz * 1000.0).clamp(-limit, limit)
 }
 
+/// O kolik od VFO (DC) posadit stanici při skoku na oblíbenou.
+///
+/// Celý kanál [offset ± šířka/2] musí být mimo mrtvou zónu kolem DC, jinak by
+/// spur padl dovnitř. U úzkých režimů stačí drobných 10 kHz. U širokého FM
+/// (kanál ±90 kHz) je to málo - tam stanici posadíme do poloviny mezi VFO
+/// a okraj okna, ať má DC spur i okraj z obou stran rezervu.
+fn park_offset(bandwidth_hz: f64, span_hz: f64) -> f64 {
+    let needs = bandwidth_hz / 2.0 + DC_GUARD_HZ;
+    if needs <= PARK_OFFSET_HZ {
+        return PARK_OFFSET_HZ;
+    }
+    // Půl cesty ke kraji, ale ať se kanál pořád vejde do zachyceného spektra.
+    let max_off = (span_hz * 0.45 - bandwidth_hz / 2.0).max(needs);
+    (span_hz / 4.0).clamp(needs, max_off)
+}
+
 /// Najde nejsilnější stanici v panoramatu a vrátí její offset od středu v Hz.
 ///
 /// Vynechává okolí DC, kde má SoftRock spur (jinak by to skákalo pořád na něj),
@@ -1637,7 +1609,9 @@ impl eframe::App for App {
                 }
             });
             ui.add_space(2.0);
-            ui.horizontal(|ui| {
+            // Zalamovací - na RSP1 sem přibude zisk a vzorkovačka, ať se to
+            // na užším okně přelije na druhý řádek místo useknutí.
+            ui.horizontal_wrapped(|ui| {
                 // Přepínač rádia - přepne se hned za běhu, bez restartu.
                 ui.label("rádio:");
                 let mut switch_hw = None;
@@ -1670,6 +1644,42 @@ impl eframe::App for App {
                     }
                     self.request_reopen();
                 }
+
+                // Ovládání specifické pro RSP1 patří na panel, ne do nastavení -
+                // zisk se ladí za poslechu, vzorkovačka mění šířku panoramatu.
+                if self.set.hardware == source::Hardware::Rsp1 {
+                    ui.separator();
+                    if let Some(g) = *self.shared.gain_range.lock().unwrap() {
+                        ui.label("zisk:");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.set.rsp1_gain_db, g.min..=g.max)
+                                    .fixed_decimals(1)
+                                    .suffix(" dB"),
+                            )
+                            .on_hover_text("zesílení LNA - projeví se hned")
+                            .changed()
+                        {
+                            let _ = self.gain_tx.send(self.set.rsp1_gain_db);
+                        }
+                    }
+                    let puvodni = self.set.rsp1_rate_hz;
+                    egui::ComboBox::from_id_salt("rsp1_rate_top")
+                        .selected_text(format!("{:.3} MHz", puvodni / 1e6))
+                        .show_ui(ui, |ui| {
+                            for &r in source::RSP1_RATES_HZ {
+                                ui.selectable_value(
+                                    &mut self.set.rsp1_rate_hz,
+                                    r,
+                                    format!("{:.3} MHz · panorama {:.0} kHz", r / 1e6, r / 1000.0),
+                                );
+                            }
+                        });
+                    if self.set.rsp1_rate_hz != puvodni {
+                        self.request_reopen();
+                    }
+                }
+
                 ui.separator();
                 ui.label("hlasitost:");
                 ui.add(egui::Slider::new(&mut self.set.volume, 0.0..=1.0).show_value(false));
@@ -2091,6 +2101,22 @@ mod tests {
     fn bez_zoomu_vyrez_stoji_na_stredu() {
         assert_eq!(pan_view_center(30_000.0, 0.0, SPAN, SPAN), 0.0);
         assert_eq!(pan_view_center(-40_000.0, 10_000.0, SPAN, SPAN), 0.0);
+    }
+
+    /// Úzké režimy parkují blízko (10 kHz), ale široký FM kanál musí skočit
+    /// dál od DC, jinak by spur padl doprostřed kanálu a nehrálo by to.
+    #[test]
+    fn park_offset_podle_sirky_kanalu() {
+        let rsp1 = 1_344_000.0;
+        // SSB/AM: drobný posun zůstává.
+        assert_eq!(park_offset(2_700.0, rsp1), PARK_OFFSET_HZ);
+        assert_eq!(park_offset(8_000.0, rsp1), PARK_OFFSET_HZ);
+        // WFM (180 kHz): skočí do poloviny mezi VFO a okraj.
+        let wfm = park_offset(180_000.0, rsp1);
+        assert_eq!(wfm, rsp1 / 4.0, "WFM má skočit do čtvrtiny šířky = půl k okraji");
+        // A celý kanál je mimo DC spur i uvnitř zachyceného spektra.
+        assert!(wfm - 90_000.0 > DC_GUARD_HZ, "kanál zasahuje do DC zóny");
+        assert!(wfm + 90_000.0 < rsp1 * 0.5, "kanál vyčnívá ze spektra");
     }
 
     /// Střed výřezu se nikdy nedostane za zachycené spektrum.
