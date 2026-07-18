@@ -3,10 +3,12 @@
 //! O to, odkud se vzorky berou a v jakém formátu jsou na drátě, se stará
 //! [`crate::audio`]; sem už chodí hotové f32.
 
-use crate::audio::{self, Depth};
 use crate::decode::{Decoder, RttyConfig};
 use crate::dsp::{Demod, Mode};
+use crate::settings::Settings;
+use crate::source::{self, Tuner};
 use anyhow::Result;
+use std::sync::mpsc;
 use num_complex::Complex32;
 use rustfft::FftPlanner;
 use std::f32::consts::PI;
@@ -21,6 +23,8 @@ pub const FFT_SIZE: usize = 2048;
 pub const AM_BANDWIDTH_HZ: f64 = 8_000.0;
 /// Výchozí šířka pásma pro SSB - obvyklá hodnota pro fonii.
 pub const SSB_BANDWIDTH_HZ: f64 = 2_700.0;
+/// Výchozí šířka pásma pro NFM - amatérský kanál 12,5 kHz s rezervou na zdvih.
+pub const NFM_BANDWIDTH_HZ: f64 = 16_000.0;
 
 /// Meze šířky pásma podle režimu.
 ///
@@ -34,6 +38,11 @@ pub fn bandwidth_range(mode: Mode) -> (f64, f64) {
         Mode::Cw => (CW_MIN_BANDWIDTH_HZ, 2_000.0),
         Mode::Usb | Mode::Lsb => (400.0, 4_000.0),
         Mode::Am => (1_000.0, 24_000.0),
+        // WFM má kanál pevně daný (Carson ~180 kHz), šířka se neladí -
+        // GUI proto u WFM posuvník skrývá. Rozsah je tu jen pro úplnost.
+        Mode::Wfm => (180_000.0, 180_000.0),
+        // NFM: od úzkého kanálu (~11 kHz) po širší amatérský (~20 kHz).
+        Mode::Nfm => (8_000.0, 20_000.0),
     }
 }
 
@@ -95,8 +104,11 @@ pub struct Shared {
     pub spectrum: Mutex<Spectrum>,
     /// Stav zvukového vstupu.
     pub status: Mutex<String>,
-    /// Stav SoftRocku na USB. Zvlášť, ať si to dvě vlákna nepřepisují.
+    /// Stav rádia. Zvlášť od `status`, ať si to dvě vlákna nepřepisují.
     pub hw_status: Mutex<String>,
+    /// Rozsah zisku otevřeného rádia, nebo `None`, když se zisk neřídí
+    /// (SoftRock) nebo rádio ještě není. Plní ladicí vlákno, čte GUI.
+    pub gain_range: Mutex<Option<crate::source::GainRange>>,
     /// Text z dekodéru, který si GUI průběžně vyzvedává.
     pub decoded: Mutex<String>,
     /// Skutečná vzorkovací frekvence vstupu = šířka panoramatu.
@@ -105,6 +117,11 @@ pub struct Shared {
     pub level_dbfs: AtomicU32,
     /// Odhadnuté tempo CW ve WPM (bity f32), 0 = neběží CW dekodér.
     pub cw_wpm: AtomicU32,
+    /// GUI sem dá nastavení, se kterým se má rádio znovu otevřít (jiné rádio,
+    /// vzorkovačka, zvukovka...), a zvedne `reopen`. DSP vlákno to převezme.
+    pub reopen_config: Mutex<Option<Settings>>,
+    /// Žádost o znovuotevření zdroje za běhu. DSP smyčka to hlídá každé čtení.
+    pub reopen: AtomicBool,
     pub running: Arc<AtomicBool>,
 }
 
@@ -114,11 +131,14 @@ impl Shared {
             controls: Mutex::new(Controls::default()),
             spectrum: Mutex::new(Spectrum::default()),
             status: Mutex::new("startuji...".to_string()),
-            hw_status: Mutex::new("hledám SoftRock...".to_string()),
+            hw_status: Mutex::new("hledám rádio...".to_string()),
+            gain_range: Mutex::new(None),
             decoded: Mutex::new(String::new()),
             sample_rate: AtomicU32::new(96_000),
             level_dbfs: AtomicU32::new((-120.0f32).to_bits()),
             cw_wpm: AtomicU32::new(0f32.to_bits()),
+            reopen_config: Mutex::new(None),
+            reopen: AtomicBool::new(false),
             running: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -132,23 +152,45 @@ impl Shared {
     }
 }
 
-/// Kolik rámců si říct od vstupu najednou.
+/// Kolik vzorků si říct od zdroje najednou.
 const READ_FRAMES: usize = 1024;
 
+/// Jak často nejvýš přepočítat panorama. Na 96 kHz vychází FFT každých 2048
+/// vzorků na ~47×/s, ale na 1,344 MSps z RSP1 by to bylo 656×/s - zbytečně,
+/// GUI stejně kreslí ~60×/s. Bez tohohle by FFT sežrala jádro nadarmo.
+const FFT_INTERVAL: Duration = Duration::from_millis(16);
+
 pub fn spawn(
-    device: String,
-    depth: Depth,
+    set: Settings,
     shared: Arc<Shared>,
     audio_tx: rtrb::Producer<f32>,
+    tuner_tx: mpsc::Sender<Box<dyn Tuner>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut audio_tx = audio_tx;
+        let mut set = set;
         while shared.running.load(Ordering::Relaxed) {
-            match run(&device, depth, &shared, &mut audio_tx) {
-                Ok(()) => break,
+            // Nové nastavení od GUI (přepnutí rádia, vzorkovačky, zvukovky)?
+            if let Some(cfg) = shared.reopen_config.lock().unwrap().take() {
+                set = cfg;
+            }
+            shared.reopen.store(false, Ordering::Relaxed);
+
+            match run(&set, &shared, &mut audio_tx, &tuner_tx) {
+                // Ok = buď se končí (running=false), nebo přišla žádost o
+                // přepnutí; o tom rozhodne vnější while, ne break.
+                Ok(()) => {}
                 Err(e) => {
                     *shared.status.lock().unwrap() = format!("chyba vstupu: {e}");
-                    std::thread::sleep(Duration::from_secs(2));
+                    // Krátké kroky, ať přepnutí z rozbitého rádia není líné.
+                    for _ in 0..20 {
+                        if !shared.running.load(Ordering::Relaxed)
+                            || shared.reopen.load(Ordering::Relaxed)
+                        {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                 }
             }
         }
@@ -156,34 +198,29 @@ pub fn spawn(
 }
 
 fn run(
-    device: &str,
-    depth: Depth,
+    set: &Settings,
     shared: &Arc<Shared>,
     audio_tx: &mut rtrb::Producer<f32>,
+    tuner_tx: &mpsc::Sender<Box<dyn Tuner>>,
 ) -> Result<()> {
-    let mut cap = audio::open_capture(device, depth)?;
-    let neg = cap.negotiated();
-    let actual_rate = neg.rate as f64;
-    shared.sample_rate.store(neg.rate, Ordering::Relaxed);
+    // Obě půlky rádia se otevírají naráz; ladění pak předáme svému vláknu,
+    // ať nás zápis po USB nebrzdí v téhle smyčce.
+    let (mut src, tuner) = source::open(set.hardware, set)?;
+    *shared.hw_status.lock().unwrap() = tuner.label();
+    let _ = tuner_tx.send(tuner);
 
-    // Prázdný název znamená u cpalu výchozí zařízení systému.
-    let kde = if device.is_empty() {
-        "výchozího zařízení".to_string()
-    } else {
-        device.to_string()
-    };
-    *shared.status.lock().unwrap() = format!(
-        "příjem z {kde} @ {:.0} kHz, {} bit ({})",
-        actual_rate / 1000.0,
-        neg.bits,
-        audio::backend_name()
-    );
+    let actual_rate = src.rate();
+    shared
+        .sample_rate
+        .store(actual_rate as u32, Ordering::Relaxed);
+    *shared.status.lock().unwrap() = src.label();
 
     // Decimace na ~48 kHz audio.
     let decim = ((actual_rate / AUDIO_RATE).round() as usize).max(1);
 
     let mut rx = Demod::new(actual_rate, decim, AM_BANDWIDTH_HZ, Mode::Am);
-    let mut raw = vec![0f32; READ_FRAMES * 2];
+    let mut raw = vec![Complex32::new(0.0, 0.0); READ_FRAMES];
+    let mut last_fft = std::time::Instant::now();
 
     let mut audio: Vec<f32> = Vec::with_capacity(1024);
     let mut iq: Vec<Complex32> = Vec::with_capacity(1024);
@@ -198,9 +235,9 @@ fn run(
     let mut smoothed = vec![-120.0f32; FFT_SIZE];
     let mut generation = 0u64;
 
-    while shared.running.load(Ordering::Relaxed) {
+    while shared.running.load(Ordering::Relaxed) && !shared.reopen.load(Ordering::Relaxed) {
         // Nula znamená, že se vstup po zádrhelu zotavil a data přijdou příště.
-        let frames = cap.read(&mut raw)?;
+        let frames = src.read(&mut raw)?;
         if frames == 0 {
             continue;
         }
@@ -224,19 +261,27 @@ fn run(
         rx.set_decoder(decoder, rtty, squelch);
 
         iq.clear();
-        for f in 0..frames {
-            let (a, b) = (raw[f * 2], raw[f * 2 + 1]);
-            iq.push(if swap {
-                Complex32::new(b, a)
+        iq.extend(raw[..frames].iter().map(|c| {
+            // SoftRocky mívají I/Q prohozené - pak je spektrum zrcadlené.
+            if swap {
+                Complex32::new(c.im, c.re)
             } else {
-                Complex32::new(a, b)
-            });
-        }
+                *c
+            }
+        }));
 
         // Panorama
         for &s in &iq {
             fft_buf.push(s);
             if fft_buf.len() == FFT_SIZE {
+                // Na vysoké vzorkovačce by okno došlo mnohem častěji, než má
+                // GUI co kreslit. Přeskočené vzorky nevadí - panorama je
+                // průběžný pohled, ne souvislý záznam.
+                if last_fft.elapsed() < FFT_INTERVAL {
+                    fft_buf.clear();
+                    continue;
+                }
+                last_fft = std::time::Instant::now();
                 let mut scratch: Vec<Complex32> =
                     fft_buf.iter().zip(&window).map(|(s, w)| s * *w).collect();
                 fft.process(&mut scratch);
@@ -288,4 +333,269 @@ fn run(
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "rsp1"))]
+mod switch_tests {
+    use super::*;
+
+    /// Přepnutí rádia za běhu, celou cestou přes skutečný hardware. Vyžaduje
+    /// připojený SoftRock i RSP1, proto `#[ignore]` - `cargo test` bez rádia
+    /// by na tom padal. Cesta ke zvukovce SoftRocku se bere z env
+    /// `KNOFLIK_TEST_CAPTURE`; bez ní se test přeskočí.
+    ///
+    /// Spustit: `KNOFLIK_TEST_CAPTURE=hw:CARD=HD,DEV=0 cargo test --release \
+    ///           prepnuti_radia_za_behu -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn prepnuti_radia_za_behu() {
+        let Ok(capture) = std::env::var("KNOFLIK_TEST_CAPTURE") else {
+            eprintln!("KNOFLIK_TEST_CAPTURE není nastaveno, přeskakuji");
+            return;
+        };
+
+        let shared = Arc::new(Shared::new());
+        let (audio_tx, _audio_rx) = rtrb::RingBuffer::<f32>::new(48_000);
+        let (tuner_tx, _tuner_rx) = mpsc::channel::<Box<dyn Tuner>>();
+
+        let mut set = Settings {
+            hardware: crate::source::Hardware::SoftRock,
+            capture_device: capture,
+            ..Settings::default()
+        };
+        let h = spawn(set.clone(), shared.clone(), audio_tx, tuner_tx);
+
+        // Počká, až se ve stavu objeví hledaný text, nebo to po `secs` vzdá.
+        let wait_for = |slovo: &str, secs: u64| -> bool {
+            let konec = std::time::Instant::now() + Duration::from_secs(secs);
+            while std::time::Instant::now() < konec {
+                if shared.status.lock().unwrap().contains(slovo) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            false
+        };
+
+        let switch = |s: &mut Settings, hw| {
+            s.hardware = hw;
+            *shared.reopen_config.lock().unwrap() = Some(s.clone());
+            shared.reopen.store(true, Ordering::Relaxed);
+        };
+
+        assert!(wait_for("ALSA", 6), "SoftRock nenaběhl: {}", shared.status.lock().unwrap());
+        let r_soft = shared.sample_rate.load(Ordering::Relaxed);
+        eprintln!("SoftRock: {} @ {r_soft} Hz", shared.status.lock().unwrap());
+
+        switch(&mut set, crate::source::Hardware::Rsp1);
+        assert!(wait_for("RSP1", 8), "nepřepnulo na RSP1: {}", shared.status.lock().unwrap());
+        let r_rsp = shared.sample_rate.load(Ordering::Relaxed);
+        assert_eq!(r_rsp, 1_344_000, "RSP1 běží na jiné vzorkovačce");
+        eprintln!("RSP1: {} @ {r_rsp} Hz", shared.status.lock().unwrap());
+
+        switch(&mut set, crate::source::Hardware::SoftRock);
+        assert!(wait_for("ALSA", 8), "nepřepnulo zpět na SoftRock: {}", shared.status.lock().unwrap());
+        eprintln!("zpět SoftRock: {} @ {} Hz", shared.status.lock().unwrap(), shared.sample_rate.load(Ordering::Relaxed));
+
+        shared.running.store(false, Ordering::Relaxed);
+        let _ = h.join();
+    }
+
+    /// WFM demodulace ze skutečné FM stanice. Naladí RSP1 na frekvenci z env
+    /// `KNOFLIK_TEST_FM_KHZ` (bez ní se přeskočí) a ověří, že z toho leze
+    /// programový zvuk, ne šum: po deemfázi má řeč/hudba drtivou většinu
+    /// energie v nízkém pásmu, kdežto neuzamčený FM šum je širokopásmový.
+    ///
+    /// Spustit: `KNOFLIK_TEST_FM_KHZ=98000 cargo test --release \
+    ///           wfm_ze_stanice -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn wfm_ze_stanice() {
+        let Ok(khz) = std::env::var("KNOFLIK_TEST_FM_KHZ") else {
+            eprintln!("KNOFLIK_TEST_FM_KHZ není nastaveno, přeskakuji");
+            return;
+        };
+        let freq_hz: f64 = khz.parse::<f64>().unwrap() * 1000.0;
+
+        let set = Settings {
+            hardware: crate::source::Hardware::Rsp1,
+            ..Settings::default()
+        };
+        let (mut src, mut tuner) = crate::source::open(set.hardware, &set).unwrap();
+        tuner.set_center(freq_hz).unwrap();
+
+        let rate = src.rate();
+        let decim = (rate / AUDIO_RATE).round() as usize;
+
+        let mut iq = vec![Complex32::new(0.0, 0.0); 8192];
+
+        // FM stanice nesedí přesně na středu okna, tak si nejsilnější nosnou
+        // najdi ve spektru (mimo DC spur RSP1) a dolaď se na ni offsetem.
+        let nfft = 4096;
+        let mut acc = vec![0.0f32; nfft];
+        let mut fftbuf = vec![Complex32::new(0.0, 0.0); nfft];
+        let mut fills = 0;
+        while fills < 8 {
+            let n = src.read(&mut iq).unwrap();
+            if n < nfft {
+                continue;
+            }
+            fftbuf.copy_from_slice(&iq[..nfft]);
+            FftPlanner::new().plan_fft_forward(nfft).process(&mut fftbuf);
+            for (a, c) in acc.iter_mut().zip(&fftbuf) {
+                *a += c.norm_sqr();
+            }
+            fills += 1;
+        }
+        // Nejsilnější bin, ale ne kolem DC (±60 kHz), kde je spur.
+        let guard_bins = (60_000.0 / rate * nfft as f64) as usize;
+        let mut best = 0usize;
+        let mut best_e = 0.0f32;
+        for (i, &e) in acc.iter().enumerate() {
+            let from_dc = i.min(nfft - i);
+            if from_dc < guard_bins {
+                continue;
+            }
+            if e > best_e {
+                best_e = e;
+                best = i;
+            }
+        }
+        // Bin -> offset v Hz (kladné i záporné).
+        let offset = if best <= nfft / 2 {
+            best as f64
+        } else {
+            best as f64 - nfft as f64
+        } * rate
+            / nfft as f64;
+        eprintln!("nejsilnější nosná na offsetu {:.0} kHz od {khz} kHz", offset / 1000.0);
+
+        let mut demod = Demod::new(rate, decim, 180_000.0, Mode::Wfm);
+        demod.set_offset(offset);
+
+        let mut audio: Vec<f32> = Vec::new();
+        // Zahoď první půlvteřinu (ustálení filtrů), pak sbírej ~2 s.
+        let mut zahozeno = 0usize;
+        while audio.len() < 96_000 {
+            let n = src.read(&mut iq).unwrap();
+            if n == 0 {
+                continue;
+            }
+            let mut a = Vec::new();
+            demod.process(&iq[..n], &mut a);
+            if zahozeno < 24_000 {
+                zahozeno += a.len();
+            } else {
+                audio.extend_from_slice(&a);
+            }
+        }
+
+        let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len() as f32).sqrt();
+        // Spektrum zvuku: poměr energie v řečovém pásmu (0,3-4 kHz) k výškám
+        // (8-15 kHz). Program má nízké pásmo mnohem silnější, šum ne.
+        let m = 32768.min(audio.len() & !1);
+        let mut buf: Vec<Complex32> =
+            audio[..m].iter().map(|&s| Complex32::new(s, 0.0)).collect();
+        FftPlanner::new().plan_fft_forward(m).process(&mut buf);
+        let bin = |hz: f64| (hz / 48_000.0 * m as f64) as usize;
+        let energy = |lo: f64, hi: f64| -> f32 {
+            buf[bin(lo)..bin(hi)].iter().map(|c| c.norm_sqr()).sum()
+        };
+        let low = energy(300.0, 4_000.0);
+        let high = energy(8_000.0, 15_000.0).max(1e-12);
+        let ratio = low / high;
+
+        eprintln!(
+            "FM {khz} kHz: audio RMS {rms:.4}, energie nízké/vysoké = {ratio:.1}×"
+        );
+        assert!(rms > 0.01, "zvuk je prakticky ticho (RMS {rms}) - stanice tam není?");
+        assert!(
+            ratio > 4.0,
+            "energie není soustředěná v programovém pásmu ({ratio:.1}×) - vypadá to jako šum, ne demodulovaná stanice"
+        );
+    }
+
+    /// NFM ze skutečného vysílání na 2 m/70 cm. Naladí na nejsilnější nosnou
+    /// v okně kolem `KNOFLIK_TEST_NFM_KHZ` a demoduluje ji úzkopásmovou FM.
+    /// Shovívavý: na amatérských pásmech nemusí zrovna nikdo mluvit, takže jen
+    /// ověří, že to běží a vypíše charakteristiku - obsah posoudí člověk uchem.
+    ///
+    /// Spustit: `KNOFLIK_TEST_NFM_KHZ=145000 cargo test --release \
+    ///           nfm_z_vysilani -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn nfm_z_vysilani() {
+        let Ok(khz) = std::env::var("KNOFLIK_TEST_NFM_KHZ") else {
+            eprintln!("KNOFLIK_TEST_NFM_KHZ není nastaveno, přeskakuji");
+            return;
+        };
+        let freq_hz: f64 = khz.parse::<f64>().unwrap() * 1000.0;
+
+        let set = Settings {
+            hardware: crate::source::Hardware::Rsp1,
+            rsp1_gain_db: 40.0,
+            ..Settings::default()
+        };
+        let (mut src, mut tuner) = crate::source::open(set.hardware, &set).unwrap();
+        tuner.set_center(freq_hz).unwrap();
+        let rate = src.rate();
+        let decim = (rate / AUDIO_RATE).round() as usize;
+
+        let mut iq = vec![Complex32::new(0.0, 0.0); 8192];
+        // Najdi nejsilnější nosnou v okně mimo DC spur.
+        let nfft = 4096;
+        let mut acc = vec![0.0f32; nfft];
+        let mut fb = vec![Complex32::new(0.0, 0.0); nfft];
+        for _ in 0..8 {
+            let n = src.read(&mut iq).unwrap();
+            if n < nfft {
+                continue;
+            }
+            fb.copy_from_slice(&iq[..nfft]);
+            FftPlanner::new().plan_fft_forward(nfft).process(&mut fb);
+            for (a, c) in acc.iter_mut().zip(&fb) {
+                *a += c.norm_sqr();
+            }
+        }
+        let guard = (30_000.0 / rate * nfft as f64) as usize;
+        let mut best = 0;
+        let mut be = 0.0f32;
+        for (i, &e) in acc.iter().enumerate() {
+            if i.min(nfft - i) < guard {
+                continue;
+            }
+            if e > be {
+                be = e;
+                best = i;
+            }
+        }
+        let offset = if best <= nfft / 2 { best as f64 } else { best as f64 - nfft as f64 }
+            * rate
+            / nfft as f64;
+
+        let mut demod = Demod::new(rate, decim, NFM_BANDWIDTH_HZ, Mode::Nfm);
+        demod.set_offset(offset);
+        let mut audio: Vec<f32> = Vec::new();
+        let mut skip = 0usize;
+        while audio.len() < 96_000 {
+            let n = src.read(&mut iq).unwrap();
+            if n == 0 {
+                continue;
+            }
+            let mut a = Vec::new();
+            demod.process(&iq[..n], &mut a);
+            if skip < 24_000 {
+                skip += a.len();
+            } else {
+                audio.extend_from_slice(&a);
+            }
+        }
+        let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len() as f32).sqrt();
+        let sig_dbfs = demod.level_dbfs();
+        eprintln!(
+            "NFM u {khz} kHz: nosná na offsetu {:.0} kHz, síla {sig_dbfs:.0} dBFS, audio RMS {rms:.4}",
+            offset / 1000.0
+        );
+        assert!(rms.is_finite() && rms >= 0.0, "audio je rozbité (RMS {rms})");
+    }
 }

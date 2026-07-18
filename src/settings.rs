@@ -5,6 +5,7 @@
 
 use crate::audio::{self, Depth};
 use crate::decode::Decoder;
+use crate::source::Hardware;
 use crate::dsp::Mode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -36,11 +37,20 @@ pub struct BandMemory {
 /// Kalibrovaný krystal Si570. Kus od kusu se liší, proto je to v nastavení -
 /// špatná hodnota posune celou stupnici.
 pub const SI570_XTAL_HZ: f64 = 114_269_790.0;
+/// Zisk RSP1 na startu. Uprostřed rozsahu LNA (0-10,2 dB) - viz docs/sdrplay-rsp1.md.
+pub const RSP1_DEFAULT_GAIN_DB: f64 = 6.0;
 pub const SI570_I2C_ADDR: u16 = 0x55;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Settings {
+    /// Které rádio jede.
+    pub hardware: Hardware,
+    /// Zisk RSP1 v dB. SoftRock zisk neřídí, tak se ho to netýká.
+    pub rsp1_gain_db: f64,
+    /// Vzorkovačka RSP1 v Hz - určuje šířku panoramatu i zátěž. Musí být
+    /// z `source::RSP1_RATES_HZ`, jinak by decimace nevyšla celočíselně.
+    pub rsp1_rate_hz: f64,
     /// Zvukovka s I/Q ze SoftRocku. Na ALSA třeba "hw:CARD=HD,DEV=0",
     /// u cpalu jméno zařízení nebo prázdno pro výchozí.
     pub capture_device: String,
@@ -58,6 +68,7 @@ pub struct Settings {
     pub bandwidth_am_hz: f64,
     pub bandwidth_ssb_hz: f64,
     pub bandwidth_cw_hz: f64,
+    pub bandwidth_nfm_hz: f64,
     pub volume: f32,
     pub swap_iq: bool,
     pub db_min: f32,
@@ -83,6 +94,9 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            hardware: Hardware::SoftRock,
+            rsp1_gain_db: RSP1_DEFAULT_GAIN_DB,
+            rsp1_rate_hz: crate::source::RSP1_DEFAULT_RATE_HZ,
             capture_device: audio::default_capture_device(),
             playback_device: audio::default_playback_device(),
             depth: Depth::Auto,
@@ -94,6 +108,7 @@ impl Default for Settings {
             bandwidth_am_hz: crate::radio::AM_BANDWIDTH_HZ,
             bandwidth_ssb_hz: crate::radio::SSB_BANDWIDTH_HZ,
             bandwidth_cw_hz: crate::radio::CW_BANDWIDTH_HZ,
+            bandwidth_nfm_hz: crate::radio::NFM_BANDWIDTH_HZ,
             volume: 0.5,
             swap_iq: false,
             db_min: -110.0,
@@ -119,6 +134,9 @@ impl Settings {
             Mode::Cw => self.bandwidth_cw_hz,
             Mode::Usb | Mode::Lsb => self.bandwidth_ssb_hz,
             Mode::Am => self.bandwidth_am_hz,
+            Mode::Nfm => self.bandwidth_nfm_hz,
+            // WFM má kanál pevný, šířka se neukládá ani neladí.
+            Mode::Wfm => crate::radio::bandwidth_range(Mode::Wfm).0,
         }
     }
 
@@ -127,6 +145,8 @@ impl Settings {
             Mode::Cw => self.bandwidth_cw_hz = bw,
             Mode::Usb | Mode::Lsb => self.bandwidth_ssb_hz = bw,
             Mode::Am => self.bandwidth_am_hz = bw,
+            Mode::Nfm => self.bandwidth_nfm_hz = bw,
+            Mode::Wfm => {}
         }
     }
 }
@@ -282,6 +302,9 @@ mod tests {
     #[test]
     fn ulozeni_a_nacteni_zachova_hodnoty() {
         let s = Settings {
+            hardware: Hardware::Rsp1,
+            rsp1_gain_db: 4.5,
+            rsp1_rate_hz: 1_920_000.0,
             capture_device: "hw:CARD=HD,DEV=0".into(),
             playback_device: "pulse".into(),
             depth: Depth::Bits16,
@@ -293,6 +316,7 @@ mod tests {
             bandwidth_am_hz: 5500.0,
             bandwidth_ssb_hz: 2400.0,
             bandwidth_cw_hz: 500.0,
+            bandwidth_nfm_hz: 16_000.0,
             volume: 0.33,
             swap_iq: true,
             db_min: -120.0,

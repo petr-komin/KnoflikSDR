@@ -35,8 +35,15 @@ ureq = "3.3.0"
 # jen tak se dostaneme na packed 24 bit (S243LE), což je na dynamickém rozsahu
 # panoramatu znát. Jinde to jede přes cpal (WASAPI / CoreAudio), kde o formát
 # rozhoduje zvukový server a hloubka bývá menší.
+# SDRplay RSP1 jede přes SoapySDR, což je systémová knihovna dostupná jen na Linuxu
+# (a chce libsoapysdr-dev). Kdo má jen SoftRock, může si ji odpustit: `--no-default-features`.
+[features]
+default = ["rsp1"]
+rsp1 = ["dep:soapysdr"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = "0.11"
+soapysdr = { version = "0.4", optional = true }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 cpal = "0.18"

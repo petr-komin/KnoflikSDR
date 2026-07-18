@@ -1,4 +1,5 @@
-//! Bandplan pro IARU Region 1 (Evropa) - jen HF úseky, které SoftRock pokrývá.
+//! Bandplan pro IARU Region 1 (Evropa). Krátkovlnná amatérská a rozhlasová
+//! pásma, plus pár VKV/UHF úseků pro orientaci se širokopásmovým rádiem (RSP1).
 //!
 //! Vlastní tabulka, ne převzatá z Quisku. Slouží k obarvení panoramatu,
 //! ne k dodržování předpisů - pro vysílání si vždycky ověř aktuální bandplan.
@@ -142,6 +143,37 @@ pub const SEGMENTS: &[Segment] = &[
     seg(28070.0, 28190.0, Usage::Digital, "10 m"),
     seg(28190.0, 28225.0, Usage::Beacon, "10 m"),
     seg(28225.0, 29700.0, Usage::Phone, "10 m"),
+    // --- VKV a UHF ---
+    // Jen SoftRock je krátkovlnný; sem dosáhne širokopásmové rádio (RSP1).
+    // RSP1 ladí souvisle do 2 GHz - "díry" 108-162, 240-470 MHz, které hlásí
+    // SoapyMiri, jsou jen lež v metadatech (ověřeno, viz docs/sdrplay-rsp1.md
+    // §2), takže 2 m i 70 cm normálně jdou.
+    //
+    // Pozor: rozhlas na VKV je širokopásmová FM (režim WFM), DAB/DVB-T jsou
+    // digitální a ty přijímač neumí - jejich značky slouží jen k orientaci.
+    //
+    // 6 m
+    seg(50_000.0, 50_100.0, Usage::Cw, "6 m"),
+    seg(50_100.0, 52_000.0, Usage::Phone, "6 m"),
+    // OIRT - starý východní VKV rozhlas, dnes skoro prázdný.
+    seg(65_800.0, 74_000.0, Usage::Broadcast, "OIRT"),
+    // VKV rozhlas (FM, CCIR) - hlavní.
+    seg(87_500.0, 108_000.0, Usage::Broadcast, "FM"),
+    // 2 m
+    seg(144_000.0, 144_150.0, Usage::Cw, "2 m"),
+    seg(144_150.0, 144_400.0, Usage::Phone, "2 m"),
+    seg(144_400.0, 144_490.0, Usage::Beacon, "2 m"),
+    seg(144_490.0, 146_000.0, Usage::Phone, "2 m"),
+    // DAB, III. TV pásmo.
+    seg(174_000.0, 240_000.0, Usage::Broadcast, "DAB"),
+    // 70 cm
+    seg(430_000.0, 432_000.0, Usage::Phone, "70 cm"),
+    seg(432_000.0, 432_100.0, Usage::Cw, "70 cm"),
+    seg(432_100.0, 440_000.0, Usage::Phone, "70 cm"),
+    // DVB-T, IV./V. TV pásmo.
+    seg(470_000.0, 690_000.0, Usage::Broadcast, "UHF TV"),
+    // 23 cm
+    seg(1_240_000.0, 1_300_000.0, Usage::Phone, "23 cm"),
 ];
 
 /// Celé pásmo poskládané ze svých úseků.
@@ -292,6 +324,44 @@ mod tests {
     #[test]
     fn mimo_pasma_nic() {
         assert!(at(6800.0).is_none(), "6800 kHz není v žádném úseku");
+    }
+
+    /// VKV rozhlas musí být v bandplanu a označený jako rozhlas - to je to,
+    /// co uživatel chtěl vidět na RSP1.
+    #[test]
+    fn fm_rozhlas_je_vyznaceny() {
+        let s = at(98_000.0).expect("FM rozhlas na 98 MHz");
+        assert_eq!(s.usage, Usage::Broadcast);
+        assert_eq!(s.band, "FM");
+        // A jako pásmo se pozná, že je rozhlasové.
+        let fm = bands().into_iter().find(|b| b.name == "FM").unwrap();
+        assert!(fm.is_broadcast());
+    }
+
+    /// Všechny úseky se musí vejít do souvislého rozsahu RSP1 (do 2 GHz).
+    /// "Díry" knihovny jsou lež v metadatech, ověřeno na hardwaru - takže
+    /// tady kontrolujeme jen skutečný strop, ne vymyšlené mezery.
+    #[test]
+    fn useky_jsou_v_rozsahu_rsp1() {
+        for s in SEGMENTS {
+            assert!(
+                s.to_khz <= 2_000_000.0,
+                "{} sahá nad 2 GHz ({} kHz)",
+                s.band,
+                s.to_khz
+            );
+        }
+    }
+
+    /// Amatérská VHF/UHF pásma musí být v nabídce - o to uživatel žádal.
+    #[test]
+    fn amaterska_vkv_pasma_existuji() {
+        assert_eq!(at(50_150.0).unwrap().band, "6 m");
+        assert_eq!(at(145_000.0).unwrap().band, "2 m");
+        assert_eq!(at(432_200.0).unwrap().band, "70 cm");
+        assert_eq!(at(1_296_000.0).unwrap().band, "23 cm");
+        // A jsou to amatérská pásma (fonie/CW), ne rozhlas.
+        assert!(!bands().into_iter().find(|b| b.name == "2 m").unwrap().is_broadcast());
     }
 
     #[test]

@@ -17,9 +17,26 @@ use num_complex::Complex32;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
-/// Koeficienty antialiasingové propusti před decimací. Je široká, takže
-/// jich stačí málo.
-const PRE_TAPS: usize = 127;
+/// Nejmíň koeficientů antialiasingové propusti. Na malé decimaci (SoftRock,
+/// 96 kHz -> 48 kHz) je propust široká a tolik jich bohatě stačí.
+const PRE_TAPS_MIN: usize = 127;
+/// Strop, ať se to nezvrhne u nesmyslně velké decimace.
+const PRE_TAPS_MAX: usize = 1535;
+
+/// Kolik koeficientů potřebuje antialiasingová propust před decimací.
+///
+/// Přechodové pásmo FIR je zhruba `3,3 × vstupní_rychlost / počet_koeficientů`
+/// a musí se vejít mezi konec propusti (0,45 × výstupní) a první alias
+/// (0,55 × výstupní), tedy do 0,1 × výstupní. Z toho vyjde počet koeficientů
+/// úměrný decimaci - na 96 kHz vstupu (decim 2) stačí desítky, na 1,344 MSps
+/// z RSP1 (decim 28) je potřeba přes tisíc, jinak by se alias složil do zvuku.
+///
+/// Platit se za to nemusí: [`FirDecim`] počítá skalární součin jen na výstupním
+/// vzorku, takže cena je `koeficienty × výstupní_rychlost` bez ohledu na vstupní.
+fn pre_taps(decim: usize) -> usize {
+    let n = (40 * decim).clamp(PRE_TAPS_MIN, PRE_TAPS_MAX);
+    n | 1 // liché, ať je FIR symetrický kolem středu
+}
 /// Koeficienty kanálového filtru. Ten běží až za decimací, tedy na čtvrtinové
 /// vzorkovačce - proto při stejném počtu koeficientů vyjde přechodové pásmo
 /// mnohem užší a dá se dělat pořádný CW filtr.
@@ -32,6 +49,13 @@ pub enum Mode {
     Usb,
     Lsb,
     Cw,
+    /// Širokopásmová FM - rozhlas na VKV. Jiný řetězec než ostatní: kanál je
+    /// ~180 kHz široký, demoduluje se frekvenčním diskriminátorem. Dává smysl
+    /// jen na širokopásmovém vstupu (RSP1), na krátkovlnném SoftRocku ne.
+    Wfm,
+    /// Úzkopásmová FM - amatérský provoz na 2 m/70 cm, kanál ~16 kHz. Vejde se
+    /// do stejného řetězce jako AM/SSB, jen za kanálovým filtrem je diskriminátor.
+    Nfm,
 }
 
 impl Mode {
@@ -41,11 +65,18 @@ impl Mode {
             Mode::Usb => "USB",
             Mode::Lsb => "LSB",
             Mode::Cw => "CW",
+            Mode::Wfm => "WFM",
+            Mode::Nfm => "NFM",
         }
     }
 
     pub fn is_ssb(&self) -> bool {
         matches!(self, Mode::Usb | Mode::Lsb)
+    }
+
+    /// Širokopásmová FM potřebuje vlastní demodulační cestu.
+    pub fn is_wfm(&self) -> bool {
+        matches!(self, Mode::Wfm)
     }
 }
 
@@ -117,8 +148,9 @@ pub fn lowpass_taps(cutoff_hz: f64, sample_rate: f64, n: usize) -> Vec<f32> {
 pub fn filter_taps(mode: Mode, bandwidth_hz: f64, sample_rate: f64, n: usize) -> Vec<Complex32> {
     let proto = lowpass_taps(bandwidth_hz / 2.0, sample_rate, n);
     let shift = match mode {
-        // AM i CW jsou symetrické kolem nosné.
-        Mode::Am | Mode::Cw => 0.0,
+        // AM, CW i NFM jsou symetrické kolem nosné. WFM sem nechodí (má vlastní
+        // řetězec), ale ať je match úplný, chová se jako symetrický.
+        Mode::Am | Mode::Cw | Mode::Wfm | Mode::Nfm => 0.0,
         Mode::Usb => bandwidth_hz / 2.0,
         Mode::Lsb => -bandwidth_hz / 2.0,
     };
@@ -251,6 +283,131 @@ impl Agc {
     }
 }
 
+/// Šířka FM rozhlasového kanálu (Carson: 2×(75 kHz zdvih + 15 kHz audio)).
+const FM_CHANNEL_HZ: f64 = 180_000.0;
+/// Maximální zdvih FM rozhlasu - podle něj se diskriminátor normuje na ±1.
+const FM_DEVIATION_HZ: f64 = 75_000.0;
+/// Časová konstanta deemfáze pro Evropu (CCIR). USA má 75 µs.
+const FM_DEEMPHASIS_S: f64 = 50e-6;
+/// Nejvyšší modulační kmitočet FM rozhlasu - meze audio propusti.
+const FM_AUDIO_HZ: f64 = 15_000.0;
+
+/// Typický zdvih amatérské úzkopásmové FM - normuje diskriminátor na ±1.
+const NFM_DEVIATION_HZ: f64 = 5_000.0;
+/// Meze audio propusti u NFM - lidský hlas, zbytek je jen syčení.
+const NFM_AUDIO_HZ: f64 = 3_400.0;
+
+/// Zvolí decimaci na mezifrekvenci pro WFM: vstup se nejdřív stáhne na
+/// pásmo dost široké pro FM kanál (~200-400 kHz), tam se demoduluje, a teprve
+/// pak jde zvuk dolů na 48 kHz. Vrací dělitele `total_decim`, který trefí
+/// mezifrekvenci nejblíž cíli; obě decimace pak vyjdou celočíselně.
+fn wfm_if_decim(in_rate: f64, total_decim: usize) -> usize {
+    const TARGET_IF: f64 = 300_000.0;
+    const MIN_IF: f64 = 200_000.0;
+    let mut best = 1;
+    let mut best_err = f64::MAX;
+    for f in 1..=total_decim {
+        if total_decim % f != 0 {
+            continue;
+        }
+        let if_rate = in_rate / f as f64;
+        if if_rate < MIN_IF {
+            continue;
+        }
+        let err = (if_rate - TARGET_IF).abs();
+        if err < best_err {
+            best_err = err;
+            best = f;
+        }
+    }
+    best
+}
+
+/// Demodulátor širokopásmové FM. Vlastní řetězec, protože FM kanál je moc
+/// široký, než aby se dal stáhnout rovnou na 48 kHz jako AM/SSB.
+struct WfmDemod {
+    /// Antialias + decimace na mezifrekvenci (široká, drží celý FM kanál).
+    if_lp: FirDecim,
+    if_rate: f64,
+    /// Předchozí vzorek pro frekvenční diskriminátor.
+    last: Complex32,
+    /// Normalizace úhlu na ±1 při plném zdvihu.
+    disc_gain: f32,
+    /// Stav a koeficient deemfáze (jednopólová dolní propust).
+    deemph_y: f32,
+    deemph_a: f32,
+    /// Audio propust + decimace z mezifrekvence na 48 kHz.
+    audio_lp: FirDecim,
+    /// Odstranění DC z rozladění (funguje jako jemné AFC do sluchátek).
+    dc: DcBlock,
+    /// Obálka mezifrekvence pro S-metr (FM má konstantní amplitudu).
+    level: f32,
+}
+
+impl WfmDemod {
+    fn new(in_rate: f64, total_decim: usize) -> Self {
+        let if_decim = wfm_if_decim(in_rate, total_decim).max(1);
+        let if_rate = in_rate / if_decim as f64;
+        let audio_decim = (total_decim / if_decim).max(1);
+
+        // MF propust: propustí celý FM kanál a zahradí alias při decimaci.
+        let if_cut = (FM_CHANNEL_HZ / 2.0).min(if_rate * 0.45);
+        let if_taps: Vec<Complex32> = lowpass_taps(if_cut, in_rate, pre_taps(if_decim))
+            .into_iter()
+            .map(|h| Complex32::new(h, 0.0))
+            .collect();
+
+        // Audio propust: do 15 kHz, zahradí alias při decimaci na 48 kHz.
+        let audio_taps: Vec<Complex32> =
+            lowpass_taps(FM_AUDIO_HZ, if_rate, pre_taps(audio_decim))
+                .into_iter()
+                .map(|h| Complex32::new(h, 0.0))
+                .collect();
+
+        let deemph_a = 1.0 - (-1.0 / (FM_DEEMPHASIS_S * if_rate)).exp();
+        WfmDemod {
+            if_lp: FirDecim::new(if_taps, if_decim),
+            if_rate,
+            last: Complex32::new(0.0, 0.0),
+            disc_gain: (if_rate / (2.0 * std::f64::consts::PI * FM_DEVIATION_HZ)) as f32,
+            deemph_y: 0.0,
+            deemph_a: deemph_a as f32,
+            audio_lp: FirDecim::new(audio_taps, audio_decim),
+            dc: DcBlock::new(0.995),
+            level: 1e-9,
+        }
+    }
+
+    /// Vstup je už smíšený na offset NCO (stejně jako u ostatních režimů),
+    /// takže sem chodí pásmo se stanicí kolem DC.
+    fn process(&mut self, mixed: Complex32, out: &mut Vec<f32>) {
+        let Some(z) = self.if_lp.push(mixed) else {
+            return;
+        };
+        // S-metr: |z| je u FM konstantní, tak stačí pomalý sledovač.
+        let mag = z.norm();
+        self.level += (mag - self.level) * 0.001;
+
+        // Frekvenční diskriminátor: úhel mezi po sobě jdoucími vzorky je
+        // úměrný okamžité frekvenci, tedy modulaci.
+        let d = z * self.last.conj();
+        self.last = z;
+        let angle = d.im.atan2(d.re);
+        let demod = angle * self.disc_gain;
+
+        // Deemfáze zvedne basy zpět po vysílačově preemfázi.
+        self.deemph_y += self.deemph_a * (demod - self.deemph_y);
+
+        if let Some(a) = self.audio_lp.push(Complex32::new(self.deemph_y, 0.0)) {
+            out.push(self.dc.push(a.re));
+        }
+    }
+
+    fn level_dbfs(&self) -> f32 {
+        20.0 * self.level.max(1e-9).log10()
+    }
+}
+
 /// Kompletní přijímač: I/Q dovnitř, mono audio ven.
 pub struct Demod {
     nco: Nco,
@@ -262,6 +419,17 @@ pub struct Demod {
     bfo: Nco,
     dc: DcBlock,
     agc: Agc,
+    /// Širokopásmová FM. Vlastní řetězec s vlastní decimací; drží se pořád,
+    /// zapojí se jen v režimu WFM.
+    wfm: WfmDemod,
+    /// Stav úzkopásmové FM (běží ve stejném řetězci jako AM/SSB).
+    /// Předchozí vzorek diskriminátoru, stav a koeficient audio propusti,
+    /// normalizace úhlu a obálka pro S-metr.
+    nfm_last: Complex32,
+    nfm_lp: f32,
+    nfm_lp_a: f32,
+    nfm_gain: f32,
+    nfm_level: f32,
     in_rate: f64,
     offset_hz: f64,
     bandwidth_hz: f64,
@@ -295,7 +463,7 @@ impl Demod {
         let out_rate = in_rate / decim as f64;
         // Před decimací stačí zahradit alias: propust těsně pod Nyquistem
         // výstupní vzorkovačky. Tvarování kanálu dělá až druhý stupeň.
-        let pre: Vec<Complex32> = lowpass_taps(out_rate * 0.45, in_rate, PRE_TAPS)
+        let pre: Vec<Complex32> = lowpass_taps(out_rate * 0.45, in_rate, pre_taps(decim))
             .into_iter()
             .map(|h| Complex32::new(h, 0.0))
             .collect();
@@ -308,6 +476,12 @@ impl Demod {
             bfo,
             dc: DcBlock::new(0.995),
             agc: Agc::new(out_rate as f32),
+            wfm: WfmDemod::new(in_rate, decim),
+            nfm_last: Complex32::new(0.0, 0.0),
+            nfm_lp: 0.0,
+            nfm_lp_a: (1.0 - (-2.0 * std::f64::consts::PI * NFM_AUDIO_HZ / out_rate).exp()) as f32,
+            nfm_gain: (out_rate / (2.0 * std::f64::consts::PI * NFM_DEVIATION_HZ)) as f32,
+            nfm_level: 1e-9,
             in_rate,
             offset_hz: 0.0,
             bandwidth_hz,
@@ -378,7 +552,13 @@ impl Demod {
 
     /// Úroveň naladěného signálu v dBFS (před AGC). Pro S-metr.
     pub fn level_dbfs(&self) -> f32 {
-        20.0 * self.agc.envelope().max(1e-9).log10()
+        match self.mode {
+            // FM má konstantní obálku, tak S-metr bere sílu z mezifrekvence,
+            // ne hlasitost audia (ta u FM se silou signálu nesouvisí).
+            Mode::Wfm => self.wfm.level_dbfs(),
+            Mode::Nfm => 20.0 * self.nfm_level.max(1e-9).log10(),
+            _ => 20.0 * self.agc.envelope().max(1e-9).log10(),
+        }
     }
 
     fn refresh_taps(&mut self) {
@@ -389,6 +569,15 @@ impl Demod {
 
     /// Zpracuje blok I/Q vzorků a připojí audio na konec `out`.
     pub fn process(&mut self, iq: &[Complex32], out: &mut Vec<f32>) {
+        // WFM má úplně jiný řetězec (široký kanál + diskriminátor), tak jde
+        // vlastní cestou. Dekodéry a AGC se ho netýkají.
+        if self.mode.is_wfm() {
+            for &x in iq {
+                let mixed = x * self.nco.next();
+                self.wfm.process(mixed, out);
+            }
+            return;
+        }
         for &x in iq {
             let mixed = x * self.nco.next();
             // Stupeň 1: zahradit alias a decimovat. Stupeň 2: vytvarovat kanál
@@ -420,11 +609,197 @@ impl Demod {
                     Mode::Usb | Mode::Lsb => z.re,
                     // CW: nosná leží na DC, tak ji BFO posune na slyšitelný tón.
                     Mode::Cw => (z * self.bfo.next()).re,
+                    // NFM: frekvenční diskriminátor na kanálově filtrovaném
+                    // signálu, pak audio propust proti syčení.
+                    Mode::Nfm => {
+                        self.nfm_level += (z.norm() - self.nfm_level) * 0.01;
+                        let d = z * self.nfm_last.conj();
+                        self.nfm_last = z;
+                        let raw = d.im.atan2(d.re) * self.nfm_gain;
+                        self.nfm_lp += self.nfm_lp_a * (raw - self.nfm_lp);
+                        self.nfm_lp
+                    }
+                    // WFM odbočuje na začátku process(), sem se nedostane.
+                    Mode::Wfm => unreachable!("WFM má vlastní řetězec"),
                 };
                 let audio = self.dc.push(detected);
                 out.push(self.agc.push(audio));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pre_taps_tests {
+    use super::*;
+
+    /// Antialiasingová propust musí na velké decimaci potlačit první alias.
+    /// Kdyby `pre_taps` nerostlo s decimací, projde přes filtr signál z okolí
+    /// a složí se do zvuku - a to je slyšet až v éteru, žádný test to jinak
+    /// nechytí. Měříme přímo přenos filtru na kmitočtu prvního aliasu.
+    fn utlum_db(taps: &[f32], f_hz: f64, rate: f64) -> f64 {
+        // DTFT filtru na dané frekvenci.
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (n, &h) in taps.iter().enumerate() {
+            let w = -2.0 * PI * f_hz * n as f64 / rate;
+            re += h as f64 * w.cos();
+            im += h as f64 * w.sin();
+        }
+        20.0 * (re * re + im * im).sqrt().log10()
+    }
+
+    #[test]
+    fn propust_potlaci_prvni_alias_i_pri_decimaci_28() {
+        // RSP1: 1,344 MSps -> 48 kHz.
+        let in_rate = 1_344_000.0;
+        let decim = 28;
+        let out_rate = in_rate / decim as f64;
+        let taps = lowpass_taps(out_rate * 0.45, in_rate, pre_taps(decim));
+
+        // V propustném pásmu nesmí nic ubrat...
+        let propust = utlum_db(&taps, 5_000.0, in_rate);
+        assert!(propust > -1.0, "propust na 5 kHz utlumena o {propust:.1} dB");
+
+        // ...a první alias (co se složí na 0 Hz) musí zmizet.
+        let alias = utlum_db(&taps, out_rate, in_rate);
+        assert!(
+            alias < -50.0,
+            "alias na {out_rate} Hz utlumen jen o {alias:.1} dB - prolezl by do zvuku"
+        );
+    }
+
+    /// SoftRock (96 kHz, decim 2) se nesmí zhoršit ani zdražit.
+    #[test]
+    fn softrock_zustava_na_minimu_koeficientu() {
+        assert_eq!(pre_taps(2), PRE_TAPS_MIN);
+        let in_rate = 96_000.0;
+        let taps = lowpass_taps(48_000.0 * 0.45, in_rate, pre_taps(2));
+        let alias = utlum_db(&taps, 48_000.0, in_rate);
+        assert!(alias < -50.0, "alias utlumen jen o {alias:.1} dB");
+    }
+
+    #[test]
+    fn pocet_koeficientu_je_vzdy_lichy() {
+        for d in [1, 2, 3, 4, 28, 100, 1000] {
+            assert_eq!(pre_taps(d) % 2, 1, "decim {d} dalo sudý počet");
+        }
+    }
+}
+
+#[cfg(test)]
+mod wfm_tests {
+    use super::*;
+    use std::f64::consts::PI;
+
+    /// Rozdělení decimace pro WFM musí dát mezifrekvenci v použitelném pásmu
+    /// (200-400 kHz) a obě dílčí decimace musí vyjít celočíselně na 48 kHz.
+    #[test]
+    fn rozdeleni_decimace_je_smysluplne() {
+        // RSP1 vzorkovačky a jejich celková decimace na 48 kHz.
+        for (rate, total) in [
+            (1_344_000.0, 28usize),
+            (1_920_000.0, 40),
+            (3_072_000.0, 64),
+            (4_800_000.0, 100),
+            (6_000_000.0, 125),
+        ] {
+            let ifd = wfm_if_decim(rate, total);
+            assert!(total % ifd == 0, "IF decimace {ifd} nedělí {total}");
+            let if_rate = rate / ifd as f64;
+            assert!(
+                (200_000.0..=450_000.0).contains(&if_rate),
+                "IF {if_rate} Hz mimo použitelné pásmo (rate {rate})"
+            );
+            let audio_decim = total / ifd;
+            assert_eq!(if_rate / audio_decim as f64, 48_000.0, "audio nevyjde na 48 kHz");
+        }
+    }
+
+    /// Diskriminátor musí z FM tónu vytáhnout modulační kmitočet. Nasyntetizuji
+    /// FM nosnou s jedním tónem a ověřím, že na výstupu je slyšet ten tón.
+    #[test]
+    fn diskriminator_demoduluje_ton() {
+        let in_rate = 1_344_000.0;
+        let decim = 28; // -> 48 kHz
+        let mut wfm = WfmDemod::new(in_rate, decim);
+
+        let tone_hz = 1_000.0; // modulační tón
+        let dev_hz = 40_000.0; // zdvih
+        let n = 48_000 * 2; // 2 s zvuku po decimaci -> dost na FFT
+        let samples = n * decim;
+
+        let mut out: Vec<f32> = Vec::new();
+        let mut phase = 0.0f64;
+        let mut tphase = 0.0f64;
+        for _ in 0..samples {
+            // Okamžitá frekvence = zdvih * sin(tón).
+            let f = dev_hz * (2.0 * PI * tphase).sin();
+            phase += 2.0 * PI * f / in_rate;
+            tphase += tone_hz / in_rate;
+            let iq = Complex32::new(phase.cos() as f32, phase.sin() as f32);
+            wfm.process(iq, &mut out);
+        }
+
+        assert!(out.len() > 4096, "málo audio vzorků: {}", out.len());
+        // Ve spektru výstupu musí dominovat 1 kHz.
+        let m = 4096.min(out.len() & !1);
+        let mut buf: Vec<Complex32> =
+            out[out.len() - m..].iter().map(|&s| Complex32::new(s, 0.0)).collect();
+        rustfft::FftPlanner::new().plan_fft_forward(m).process(&mut buf);
+        let bin_1k = (tone_hz / 48_000.0 * m as f64).round() as usize;
+        let mag: Vec<f32> = buf[..m / 2].iter().map(|c| c.norm()).collect();
+        let peak_bin = (0..m / 2).max_by(|&a, &b| mag[a].partial_cmp(&mag[b]).unwrap()).unwrap();
+        assert!(
+            (peak_bin as i64 - bin_1k as i64).abs() <= 2,
+            "špička na binu {peak_bin}, čekal jsem kolem {bin_1k} (1 kHz)"
+        );
+    }
+
+    /// NFM přes celý řetězec Demod: nasyntetizuji úzkopásmovou FM s tónem
+    /// a ověřím, že na výstupu ten tón dominuje (tedy diskriminátor za
+    /// kanálovým filtrem opravdu demoduluje).
+    #[test]
+    fn nfm_demoduluje_ton() {
+        use num_complex::Complex32;
+        let in_rate = 96_000.0; // jako SoftRock; NFM se vejde i sem
+        let decim = 2; // -> 48 kHz
+        let mut d = Demod::new(in_rate, decim, 16_000.0, Mode::Nfm);
+
+        let tone_hz = 1_200.0;
+        let dev_hz = 3_000.0;
+        let n_audio = 48_000; // 1 s
+        let samples = n_audio * decim;
+        let mut iq = Vec::with_capacity(samples);
+        let (mut ph, mut tph) = (0.0f64, 0.0f64);
+        for _ in 0..samples {
+            let f = dev_hz * (2.0 * std::f64::consts::PI * tph).sin();
+            ph += 2.0 * std::f64::consts::PI * f / in_rate;
+            tph += tone_hz / in_rate;
+            iq.push(Complex32::new(ph.cos() as f32, ph.sin() as f32));
+        }
+        let mut out = Vec::new();
+        d.process(&iq, &mut out);
+
+        assert!(out.len() > 8192, "málo audia: {}", out.len());
+        let m = 8192;
+        let mut buf: Vec<Complex32> =
+            out[out.len() - m..].iter().map(|&s| Complex32::new(s, 0.0)).collect();
+        rustfft::FftPlanner::new().plan_fft_forward(m).process(&mut buf);
+        let bin_tone = (tone_hz / 48_000.0 * m as f64).round() as usize;
+        let mag: Vec<f32> = buf[..m / 2].iter().map(|c| c.norm()).collect();
+        let peak = (1..m / 2).max_by(|&a, &b| mag[a].partial_cmp(&mag[b]).unwrap()).unwrap();
+        assert!(
+            (peak as i64 - bin_tone as i64).abs() <= 2,
+            "špička na binu {peak}, čekal jsem {bin_tone} (1,2 kHz)"
+        );
+    }
+
+    /// Bez signálu (jen šum na nule) nesmí demodulátor vyrábět silný tón.
+    #[test]
+    fn deemfaze_koeficient_je_rozumny() {
+        // Pro 336 kHz IF a 50 µs má koeficient vyjít malý kladný (<0,1).
+        let wfm = WfmDemod::new(1_344_000.0, 28);
+        assert!(wfm.deemph_a > 0.0 && wfm.deemph_a < 0.2, "a = {}", wfm.deemph_a);
     }
 }
 

@@ -11,6 +11,7 @@ mod radio;
 mod settings;
 mod schedule;
 mod si570;
+mod source;
 
 use settings::{Autosave, Settings, Station};
 
@@ -59,13 +60,10 @@ fn main() -> eframe::Result {
         radio::AUDIO_RATE as u32,
         shared.running.clone(),
     );
-    radio::spawn(
-        saved.capture_device.clone(),
-        saved.depth,
-        shared.clone(),
-        audio_tx,
-    );
-    let tuner = spawn_tuner(shared.clone(), saved.si570_xtal_hz, saved.si570_i2c_addr);
+    // Rádio otevírá DSP vlákno a ladicí půlku pošle sem přes tuner_tx.
+    let (tuner_tx, tuner_rx) = mpsc::channel::<Box<dyn source::Tuner>>();
+    let (tuner, gain_tx) = spawn_tuner(shared.clone(), tuner_rx);
+    radio::spawn(saved.clone(), shared.clone(), audio_tx, tuner_tx);
 
     // Diagnostika bez GUI: ukáže, co si capture vyjednal a jestli teče signál.
     if std::env::args().any(|a| a == "--probe") {
@@ -83,7 +81,7 @@ fn main() -> eframe::Result {
     let result = eframe::run_native(
         "KnoflikSDR",
         opts,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, app_shared, tuner, saved)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, app_shared, tuner, gain_tx, saved)))),
     );
     shared.running.store(false, Ordering::Relaxed);
     result
@@ -126,27 +124,59 @@ fn spawn_schedule_load() -> Arc<std::sync::Mutex<ScheduleState>> {
 
 /// Ladicí vlákno. USB control transfer trvá jednotky ms, takže nesmí
 /// běžet v GUI ani v audio cestě.
-fn spawn_tuner(shared: Arc<Shared>, xtal_hz: f64, i2c_addr: u16) -> mpsc::Sender<f64> {
-    let (tx, rx) = mpsc::channel::<f64>();
+/// Vlákno ladění. Samo rádio neotevírá - [`radio::spawn`] otevře obě půlky
+/// naráz a ladicí půlku sem pošle přes `tuner_rx`. Když se vstup po výpadku
+/// otevře znovu, přijde nový `Tuner` a ten starý se zahodí.
+///
+/// Je to zvlášť kvůli tomu, že u SoftRocku je ladění zápis do Si570 po USB -
+/// trvá jednotky ms a v DSP vlákně by cvakalo do zvuku.
+fn spawn_tuner(
+    shared: Arc<Shared>,
+    tuner_rx: mpsc::Receiver<Box<dyn source::Tuner>>,
+) -> (mpsc::Sender<f64>, mpsc::Sender<f64>) {
+    let (freq_tx, freq_rx) = mpsc::channel::<f64>();
+    let (gain_tx, gain_rx) = mpsc::channel::<f64>();
     std::thread::spawn(move || {
-        let mut si = match si570::Si570::open(xtal_hz, i2c_addr) {
-            Ok(mut s) => {
-                let ver = s.version().unwrap_or_else(|_| "?".into());
-                *shared.hw_status.lock().unwrap() = format!("SoftRock fw {ver}");
-                s
+        let mut tuner: Option<Box<dyn source::Tuner>> = None;
+        // Poslední přání od GUI, kdyby přišlo dřív než samo rádio.
+        let mut want_freq: Option<f64> = None;
+        let mut want_gain: Option<f64> = None;
+        while shared.running.load(Ordering::Relaxed) {
+            // Nové rádio? Převezmi ho a rovnou nalaď, kde jsme byli.
+            while let Ok(t) = tuner_rx.try_recv() {
+                *shared.gain_range.lock().unwrap() = t.gain_range();
+                tuner = Some(t);
+                if let Some(f) = want_freq {
+                    apply(&mut tuner, &shared, |t| t.set_center(f));
+                }
+                if let Some(g) = want_gain {
+                    apply(&mut tuner, &shared, |t| t.set_gain(g));
+                }
             }
-            Err(e) => {
-                *shared.hw_status.lock().unwrap() = format!("{e}");
-                return;
+            while let Ok(f) = freq_rx.try_recv() {
+                want_freq = Some(f);
+                apply(&mut tuner, &shared, |t| t.set_center(f));
             }
-        };
-        for freq in rx {
-            if let Err(e) = si.set_freq(freq) {
-                *shared.hw_status.lock().unwrap() = format!("ladění selhalo: {e}");
+            while let Ok(g) = gain_rx.try_recv() {
+                want_gain = Some(g);
+                apply(&mut tuner, &shared, |t| t.set_gain(g));
             }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     });
-    tx
+    (freq_tx, gain_tx)
+}
+
+/// Provede úkon na ladění, pokud nějaké máme, a chybu ukáže ve stavu.
+fn apply(
+    tuner: &mut Option<Box<dyn source::Tuner>>,
+    shared: &Arc<Shared>,
+    f: impl FnOnce(&mut Box<dyn source::Tuner>) -> anyhow::Result<()>,
+) {
+    let Some(t) = tuner else { return };
+    if let Err(e) = f(t) {
+        *shared.hw_status.lock().unwrap() = format!("{e}");
+    }
 }
 
 /// Výčet zvukových zařízení pro nastavení.
@@ -164,12 +194,15 @@ impl Devices {
     }
 }
 
-/// To z nastavení, co se čte jen při startu vláken. Změna se projeví
-/// až po restartu, tak ať to umíme uživateli říct.
+/// To z nastavení, co se čte při otevření rádia (vstupní strana). Když se
+/// tohle liší od stavu, se kterým rádio zrovna běží, nabídne okno „Použít".
+/// Výstupní zařízení tu schválně není - to se přes reopen neřeší, mění se
+/// až restartem.
 #[derive(PartialEq, Clone)]
 struct StartupConfig {
+    hardware: source::Hardware,
+    rsp1_rate_hz: f64,
     capture_device: String,
-    playback_device: String,
     depth: audio::Depth,
     si570_xtal_hz: f64,
     si570_i2c_addr: u16,
@@ -178,8 +211,9 @@ struct StartupConfig {
 impl StartupConfig {
     fn of(s: &Settings) -> Self {
         StartupConfig {
+            hardware: s.hardware,
+            rsp1_rate_hz: s.rsp1_rate_hz,
             capture_device: s.capture_device.clone(),
-            playback_device: s.playback_device.clone(),
             depth: s.depth,
             si570_xtal_hz: s.si570_xtal_hz,
             si570_i2c_addr: s.si570_i2c_addr,
@@ -190,9 +224,15 @@ impl StartupConfig {
 struct App {
     shared: Arc<Shared>,
     tuner: mpsc::Sender<f64>,
+    /// Zisk jde mimo `tuner` vlastním kanálem - projeví se hned, bez restartu.
+    gain_tx: mpsc::Sender<f64>,
     /// Vše, co se ukládá, drží rovnou Settings - jediný zdroj pravdy.
     set: Settings,
     vfo_input: String,
+    /// Střed viditelného výřezu panoramatu v Hz od VFO. Odděleně od naladění
+    /// (`offset_hz`), aby se při zoomu značka pohybovala a spektrum stálo,
+    /// místo aby se pořád vycentrovávalo. Neukládá se.
+    view_center_hz: f64,
     /// Táhne se zrovna hrana pásma? (Jinak by tažení ladilo.)
     drag_bw: bool,
     /// Je otevřené okno správy oblíbených? Neukládá se.
@@ -224,6 +264,7 @@ impl App {
         _cc: &eframe::CreationContext<'_>,
         shared: Arc<Shared>,
         tuner: mpsc::Sender<f64>,
+        gain_tx: mpsc::Sender<f64>,
         s: Settings,
     ) -> Self {
         // Naladit tam, kde uživatel posledně skončil.
@@ -231,8 +272,10 @@ impl App {
         App {
             shared,
             tuner,
+            gain_tx,
             set: s.clone(),
             vfo_input: format!("{:.1}", s.vfo_khz),
+            view_center_hz: s.offset_hz,
             drag_bw: false,
             show_manage: false,
             show_options: false,
@@ -250,6 +293,18 @@ impl App {
 
     fn bandwidth_hz(&self) -> f64 {
         self.set.bandwidth()
+    }
+
+    /// Řekne DSP vláknu, ať znovu otevře rádio s aktuálním nastavením.
+    /// Tím se přepne rádio, vzorkovačka nebo zvukovka za běhu, bez restartu.
+    fn request_reopen(&mut self) {
+        *self.shared.status.lock().unwrap() =
+            format!("přepínám na {}...", self.set.hardware.label());
+        // Config nejdřív, pak vlajka - DSP vlákno bere config až po ní.
+        *self.shared.reopen_config.lock().unwrap() = Some(self.set.clone());
+        self.shared.reopen.store(true, Ordering::Relaxed);
+        // Od teď je tohle „stav při startu rádia", takže tlačítko Použít zmizí.
+        self.startup = StartupConfig::of(&self.set);
     }
 
     /// Dekodér, který má opravdu běžet. Se zavřenou konzolí žádný -
@@ -272,7 +327,8 @@ impl App {
     fn band_edges(&self) -> (f64, f64) {
         let bw = self.bandwidth_hz();
         match self.set.mode {
-            dsp::Mode::Am | dsp::Mode::Cw => {
+            // FM (obě šířky) je taky symetrické kolem nosné.
+            dsp::Mode::Am | dsp::Mode::Cw | dsp::Mode::Wfm | dsp::Mode::Nfm => {
                 (self.set.offset_hz - bw / 2.0, self.set.offset_hz + bw / 2.0)
             }
             dsp::Mode::Usb => (self.set.offset_hz, self.set.offset_hz + bw),
@@ -285,37 +341,77 @@ impl App {
     fn draggable_edges(&self) -> Vec<f64> {
         let (lo, hi) = self.band_edges();
         match self.set.mode {
-            dsp::Mode::Am | dsp::Mode::Cw => vec![lo, hi],
+            dsp::Mode::Am | dsp::Mode::Cw | dsp::Mode::Nfm => vec![lo, hi],
             dsp::Mode::Usb => vec![hi],
             dsp::Mode::Lsb => vec![lo],
+            // WFM má pevnou šířku, hrany se netáhnou.
+            dsp::Mode::Wfm => vec![],
         }
     }
 
     fn set_vfo(&mut self, khz: f64) {
-        self.set.vfo_khz = khz.clamp(100.0, 60_000.0);
+        let (lo, hi) = self.set.hardware.tuning_range_khz();
+        self.set.vfo_khz = khz.clamp(lo, hi);
         self.vfo_input = format!("{:.1}", self.set.vfo_khz);
         let _ = self.tuner.send(self.set.vfo_khz * 1000.0);
     }
 
     /// Viditelný výřez panoramatu jako (střed v Hz od VFO, šířka v Hz).
     ///
-    /// Výřez sleduje naladěnou stanici, ale nikdy nevyjede ze zachyceného
-    /// spektra - u kraje se prostě zastaví.
+    /// Výřez je samostatný průzor se středem `view_center_hz` - značka ladění
+    /// se v něm pohybuje a spektrum stojí; posune se, až když značka dojede ke
+    /// kraji (řeší [`keep_offset_visible`]). U kraje zachyceného spektra se
+    /// průzor zastaví, za ním nejsou data.
     fn view(&self, span_hz: f64) -> (f64, f64) {
-        view_window(self.set.zoom, self.set.offset_hz, span_hz)
+        view_window(self.set.zoom, self.view_center_hz, span_hz)
+    }
+
+    /// Aktuální šířka zachyceného spektra (= vzorkovačka vstupu).
+    fn span_hz(&self) -> f64 {
+        self.shared.sample_rate.load(Ordering::Relaxed) as f64
     }
 
     fn set_zoom(&mut self, z: f32) {
         self.set.zoom = z.clamp(1.0, MAX_ZOOM);
+        // Po změně přiblížení ať naladěná stanice zůstane v obraze.
+        self.keep_offset_visible(self.span_hz());
+    }
+
+    /// Posune průzor tak, aby naladěná frekvence (`offset_hz`) byla vidět.
+    /// Spektrum se hne jen tehdy, když by značka jinak vyjela z okraje - jinak
+    /// stojí. Tím se ladění chová stejně při zoomu i bez něj.
+    fn keep_offset_visible(&mut self, span_hz: f64) {
+        let vis = span_hz / self.set.zoom.clamp(1.0, MAX_ZOOM) as f64;
+        self.view_center_hz = pan_view_center(self.set.offset_hz, self.view_center_hz, vis, span_hz);
+    }
+
+    /// Vycentruje průzor na naladěnou stanici. Volá se po velkých skocích
+    /// (skok na pásmo, doladění na nejsilnější, tlačítka VFO), kde je čekané,
+    /// že se pohled přesune za stanicí.
+    fn center_view_on_tuned(&mut self) {
+        self.view_center_hz = self.set.offset_hz;
+        self.keep_offset_visible(self.span_hz());
     }
 
     /// Krok jemného ladění kolečkem a šipkami. Na hrubé skoky je Shift
     /// (desetinásobek) a tlačítka VFO.
     fn tune_step_hz(&self) -> f64 {
-        if self.set.mode.is_ssb() {
+        if self.set.mode.is_wfm() {
+            // FM stanice jsou po ~100 kHz, jemnější krok kolečka nemá smysl.
+            100_000.0
+        } else if self.set.mode.is_ssb() {
             10.0
         } else {
             100.0
+        }
+    }
+
+    /// Kroky tlačítek VFO v kHz. Na RSP1 (VKV/UHF) jsou potřeba i velké skoky,
+    /// SoftRock zůstává jemný na krátkých vlnách.
+    fn vfo_steps_khz(&self) -> &'static [f64] {
+        match self.set.hardware {
+            source::Hardware::SoftRock => &[-10.0, -1.0, 1.0, 10.0],
+            source::Hardware::Rsp1 => &[-1000.0, -100.0, -10.0, 10.0, 100.0, 1000.0],
         }
     }
 
@@ -333,6 +429,8 @@ impl App {
             off -= (self.set.vfo_khz - before) * 1000.0;
         }
         self.set.offset_hz = off;
+        // Jemné ladění posune spektrum jen u kraje průzoru, jinak stojí.
+        self.keep_offset_visible(span_hz);
     }
 
     /// Krok VFO. Okno se posune do strany, ale zůstaneme naladění na stejné
@@ -343,6 +441,7 @@ impl App {
         // set_vfo si krok mohl zkrátit o meze rozsahu, tak počítáme se skutečným.
         let applied = self.set.vfo_khz - before;
         self.set.offset_hz = offset_after_vfo_step(self.set.offset_hz, applied, span_hz);
+        self.center_view_on_tuned();
     }
 
     /// Posun VFO o celou šířku okna - ukáže kus pásma, na který odsud
@@ -350,6 +449,7 @@ impl App {
     fn jump_window(&mut self, span_hz: f64, dir: f64) {
         self.set_vfo(self.set.vfo_khz + dir * span_hz / 1000.0);
         self.set.offset_hz = 0.0;
+        self.center_view_on_tuned();
         self.snap_at =
             Some(std::time::Instant::now() + std::time::Duration::from_millis(SNAP_DELAY_MS));
     }
@@ -377,9 +477,18 @@ impl App {
             return;
         }
         // Poprvé na tomhle pásmu: doprostřed a s obvyklým režimem.
-        // Rozhlas je AM, amatérská pásma pod 10 MHz LSB, nad ním USB.
-        let mode = if band.is_broadcast() {
+        // VKV rozhlas je širokopásmová FM (jen na RSP1), krátkovlnný rozhlas
+        // AM, amatérská pásma pod 10 MHz LSB, nad ním USB.
+        let fm_rozhlas = band.from_khz >= 87_000.0
+            && band.to_khz <= 108_500.0
+            && self.set.hardware == source::Hardware::Rsp1;
+        let mode = if fm_rozhlas {
+            dsp::Mode::Wfm
+        } else if band.is_broadcast() {
             dsp::Mode::Am
+        } else if band.from_khz >= 144_000.0 {
+            // 2 m a výš je doma úzkopásmová FM (simplex, převaděče).
+            dsp::Mode::Nfm
         } else if band.from_khz < 10_000.0 {
             dsp::Mode::Lsb
         } else {
@@ -389,6 +498,8 @@ impl App {
             dsp::Mode::Cw => radio::CW_BANDWIDTH_HZ,
             dsp::Mode::Usb | dsp::Mode::Lsb => radio::SSB_BANDWIDTH_HZ,
             dsp::Mode::Am => radio::AM_BANDWIDTH_HZ,
+            dsp::Mode::Nfm => radio::NFM_BANDWIDTH_HZ,
+            dsp::Mode::Wfm => radio::bandwidth_range(dsp::Mode::Wfm).0,
         };
         self.tune_to(band.middle_khz(), mode, bw);
     }
@@ -400,6 +511,7 @@ impl App {
         self.set_bandwidth_hz(bandwidth_hz);
         self.set_vfo(freq_khz - PARK_OFFSET_HZ / 1000.0);
         self.set.offset_hz = PARK_OFFSET_HZ;
+        self.center_view_on_tuned();
         self.snap_at = None; // ruční volba má přednost před hledáním
     }
 
@@ -429,6 +541,7 @@ impl App {
     fn snap_to_strongest(&mut self, bins: &[f32], span_hz: f64) {
         if let Some(off) = strongest_offset(bins, span_hz) {
             self.set.offset_hz = off;
+            self.center_view_on_tuned();
         }
     }
 
@@ -542,9 +655,13 @@ impl App {
         let here = bandplan::at(tuned_khz).map(|s| s.band);
         let mut go: Option<bandplan::Band> = None;
 
+        let (tune_lo, tune_hi) = self.set.hardware.tuning_range_khz();
         ui.horizontal_wrapped(|ui| {
             ui.label("pásma:");
             for b in &bands {
+                // Pásmo mimo dosah rádia zašedni - klik by stejně jen skočil
+                // na kraj rozsahu (třeba FM na krátkovlnném SoftRocku).
+                let reachable = b.middle_khz() >= tune_lo && b.middle_khz() <= tune_hi;
                 let active = here == Some(b.name);
                 let known = self.set.band_memory.contains_key(b.name);
                 let (r, g, bl) = if b.is_broadcast() {
@@ -557,12 +674,18 @@ impl App {
                 if active {
                     text = text.strong();
                 }
-                let tip = if known {
+                let tip = if !reachable {
+                    format!("{} je mimo dosah rádia {}", b.name, self.set.hardware.label())
+                } else if known {
                     format!("zpět tam, kde jsi na {} naposled byl", b.name)
                 } else {
                     format!("{} - doprostřed ({:.0} kHz)", b.name, b.middle_khz())
                 };
-                if ui.selectable_label(active, text).on_hover_text(tip).clicked() {
+                let resp = ui
+                    .add_enabled_ui(reachable, |ui| ui.selectable_label(active, text))
+                    .inner
+                    .on_hover_text(tip);
+                if resp.clicked() {
                     go = Some(*b);
                 }
             }
@@ -808,13 +931,75 @@ impl App {
     /// takže se změny projeví až po restartu - a okno to říká nahlas.
     fn options_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_options;
+        // Nastaví se uvnitř okna, provede až po jeho zavření - jinak by kolidoval
+        // půjčený `self` (request_reopen chce celé &mut self).
+        let mut reopen = false;
         egui::Window::new("Nastavení")
             .open(&mut open)
             .default_width(560.0)
             .show(ctx, |ui| {
+                ui.heading("Rádio");
+                ui.label(
+                    egui::RichText::new(format!(
+                        "aktuálně: {} — přepíná se selectem v liště nahoře",
+                        self.set.hardware.label()
+                    ))
+                    .weak(),
+                );
+
+                // Vzorkovačka RSP1: užší = menší panorama a míň zátěže. Jen
+                // hodnoty z nabídky, aby decimace vyšla celočíselně. Přepne hned.
+                if self.set.hardware == source::Hardware::Rsp1 {
+                    ui.horizontal(|ui| {
+                        ui.label("vzorkovačka:");
+                        let puvodni = self.set.rsp1_rate_hz;
+                        egui::ComboBox::from_id_salt("rsp1_rate")
+                            .selected_text(format!("{:.3} MHz", puvodni / 1e6))
+                            .show_ui(ui, |ui| {
+                                for &r in source::RSP1_RATES_HZ {
+                                    ui.selectable_value(
+                                        &mut self.set.rsp1_rate_hz,
+                                        r,
+                                        format!(
+                                            "{:.3} MHz  ·  panorama {:.0} kHz  ·  decim {}×",
+                                            r / 1e6,
+                                            r / 1000.0,
+                                            source::rsp1_decim(r)
+                                        ),
+                                    );
+                                }
+                            });
+                        if self.set.rsp1_rate_hz != puvodni {
+                            reopen = true;
+                        }
+                    });
+                }
+
+                // Zisk umí jen rádio, které ho hlásí; SoftRock ne.
+                let range = *self.shared.gain_range.lock().unwrap();
+                if let Some(g) = range {
+                    ui.horizontal(|ui| {
+                        ui.label("zisk [dB]:");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.set.rsp1_gain_db, g.min..=g.max)
+                                    .fixed_decimals(1),
+                            )
+                            .changed()
+                        {
+                            // Zisk se na rozdíl od zbytku projeví hned, bez reopen.
+                            let _ = self.gain_tx.send(self.set.rsp1_gain_db);
+                        }
+                    });
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
                 let devices = self
                     .devices
                     .get_or_insert_with(Devices::enumerate);
+
+                let softrock = self.set.hardware == source::Hardware::SoftRock;
 
                 ui.heading("Zvuk");
                 ui.label(
@@ -830,14 +1015,18 @@ impl App {
                     .num_columns(2)
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
-                        ui.label("vstup (I/Q):");
-                        ui.horizontal(|ui| {
-                            Self::device_picker(
-                                ui,
-                                "vstup",
-                                &mut self.set.capture_device,
-                                &devices.capture,
-                            );
+                        // Vstup a hloubka jsou jen o zvukovce se SoftRockem;
+                        // RSP1 si vzorky nese sám po USB.
+                        ui.add_enabled(softrock, egui::Label::new("vstup (I/Q):"));
+                        ui.add_enabled_ui(softrock, |ui| {
+                            ui.horizontal(|ui| {
+                                Self::device_picker(
+                                    ui,
+                                    "vstup",
+                                    &mut self.set.capture_device,
+                                    &devices.capture,
+                                );
+                            });
                         });
                         ui.end_row();
 
@@ -849,94 +1038,119 @@ impl App {
                                 &mut self.set.playback_device,
                                 &devices.playback,
                             );
-                        });
-                        ui.end_row();
-
-                        ui.label("hloubka:");
-                        ui.horizontal(|ui| {
-                            for d in audio::Depth::ALL {
-                                ui.selectable_value(&mut self.set.depth, d, d.label());
-                            }
                             ui.label(
-                                egui::RichText::new(format!("→ {}", self.set.depth.hint()))
-                                    .weak(),
+                                egui::RichText::new("(až po restartu)").weak().small(),
+                            )
+                            .on_hover_text(
+                                "výstupní zařízení se na rozdíl od zbytku mění jen restartem",
                             );
                         });
                         ui.end_row();
+
+                        ui.add_enabled(softrock, egui::Label::new("hloubka:"));
+                        ui.add_enabled_ui(softrock, |ui| {
+                            ui.horizontal(|ui| {
+                                for d in audio::Depth::ALL {
+                                    ui.selectable_value(&mut self.set.depth, d, d.label());
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!("→ {}", self.set.depth.hint()))
+                                        .weak(),
+                                );
+                            });
+                        });
+                        ui.end_row();
                     });
-                ui.label(
-                    egui::RichText::new(
-                        "24 bit umí jen ALSA na Linuxu. Přes WASAPI a CoreAudio \
-                         o formátu rozhoduje zvukový server, tam automatika cílí na 16 bit.",
-                    )
-                    .weak()
-                    .small(),
-                );
+                if softrock {
+                    ui.label(
+                        egui::RichText::new(
+                            "24 bit umí jen ALSA na Linuxu. Přes WASAPI a CoreAudio \
+                             o formátu rozhoduje zvukový server, tam automatika cílí na 16 bit.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "RSP1 jede na 1 344 kHz (= 48 kHz × 28) a vzorky si nese po USB, \
+                             takže vstupní zvukovka ani hloubka se ho netýkají.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                }
 
                 if ui.button("↻ znovu prohledat zařízení").clicked() {
                     self.devices = None;
                 }
 
-                ui.add_space(8.0);
-                ui.separator();
-                ui.heading("SoftRock");
-                egui::Grid::new("sr_grid")
-                    .num_columns(2)
-                    .spacing([8.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("krystal Si570 [Hz]:");
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::DragValue::new(&mut self.set.si570_xtal_hz)
-                                    .speed(1.0)
-                                    .range(100_000_000.0..=130_000_000.0),
-                            );
-                            if ui.button("výchozí").clicked() {
-                                self.set.si570_xtal_hz = settings::SI570_XTAL_HZ;
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label("adresa I2C:");
-                        ui.horizontal(|ui| {
-                            let mut addr = self.set.si570_i2c_addr as u32;
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut addr)
+                if self.set.hardware.uses_si570() {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.heading("SoftRock");
+                    egui::Grid::new("sr_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("krystal Si570 [Hz]:");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut self.set.si570_xtal_hz)
                                         .speed(1.0)
-                                        .range(0..=127)
-                                        .hexadecimal(2, false, true),
-                                )
-                                .changed()
-                            {
-                                self.set.si570_i2c_addr = addr as u16;
-                            }
-                            ui.label(
-                                egui::RichText::new("obvykle 0x55, u některých kusů 0x50")
-                                    .weak()
-                                    .small(),
-                            );
-                        });
-                        ui.end_row();
-                    });
-                ui.label(
-                    egui::RichText::new(
-                        "Krystal je kalibrace kus od kusu - špatná hodnota posune celou stupnici.",
-                    )
-                    .weak()
-                    .small(),
-                );
+                                        .range(100_000_000.0..=130_000_000.0),
+                                );
+                                if ui.button("výchozí").clicked() {
+                                    self.set.si570_xtal_hz = settings::SI570_XTAL_HZ;
+                                }
+                            });
+                            ui.end_row();
 
-                ui.add_space(8.0);
-                ui.separator();
-                if StartupConfig::of(&self.set) != self.startup {
+                            ui.label("adresa I2C:");
+                            ui.horizontal(|ui| {
+                                let mut addr = self.set.si570_i2c_addr as u32;
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut addr)
+                                            .speed(1.0)
+                                            .range(0..=127)
+                                            .hexadecimal(2, false, true),
+                                    )
+                                    .changed()
+                                {
+                                    self.set.si570_i2c_addr = addr as u16;
+                                }
+                                ui.label(
+                                    egui::RichText::new("obvykle 0x55, u některých kusů 0x50")
+                                        .weak()
+                                        .small(),
+                                );
+                            });
+                            ui.end_row();
+                        });
                     ui.label(
                         egui::RichText::new(
-                            "⚠ Zvuk i Si570 se čtou při startu - změny se projeví \
-                             až po restartu programu.",
+                            "Krystal je kalibrace kus od kusu - špatná hodnota posune \
+                             celou stupnici.",
                         )
-                        .color(egui::Color32::from_rgb(230, 180, 80)),
+                        .weak()
+                        .small(),
                     );
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                // Zvukovka, hloubka a Si570 se čtou při otevření rádia. Přepnutí
+                // rádia a vzorkovačky se aplikuje hned samo; tyhle až na tlačítko,
+                // ať se rádio nezavírá při každém ťuknutí do políčka.
+                if StartupConfig::of(&self.set) != self.startup {
+                    if ui
+                        .button("↻ Použít změny")
+                        .on_hover_text("znovu otevře rádio se změněnou zvukovkou / hloubkou / Si570")
+                        .clicked()
+                    {
+                        reopen = true;
+                    }
                 }
                 if let Some(p) = settings::config_path() {
                     ui.label(
@@ -947,6 +1161,9 @@ impl App {
                 }
             });
         self.show_options = open;
+        if reopen {
+            self.request_reopen();
+        }
     }
 
     /// Okno pro správu oblíbených - přejmenování, úpravy, pořadí, mazání.
@@ -986,14 +1203,23 @@ impl App {
                                 ui.add(
                                     egui::DragValue::new(&mut st.freq_khz)
                                         .speed(1.0)
-                                        .range(100.0..=60_000.0)
+                                        // Až do horní meze RSP1, ať jde uložit
+                                        // i FM nebo jiná VKV/UHF stanice.
+                                        .range(100.0..=2_000_000.0)
                                         .fixed_decimals(1),
                                 );
                                 egui::ComboBox::from_id_salt(("rezim", i))
                                     .selected_text(st.mode.label())
                                     .width(60.0)
                                     .show_ui(ui, |ui| {
-                                        for m in [dsp::Mode::Am, dsp::Mode::Usb, dsp::Mode::Lsb, dsp::Mode::Cw] {
+                                        for m in [
+                                            dsp::Mode::Am,
+                                            dsp::Mode::Usb,
+                                            dsp::Mode::Lsb,
+                                            dsp::Mode::Cw,
+                                            dsp::Mode::Nfm,
+                                            dsp::Mode::Wfm,
+                                        ] {
                                             ui.selectable_value(&mut st.mode, m, m.label());
                                         }
                                     });
@@ -1107,9 +1333,12 @@ impl App {
                     // U AM řídí obě hrany totéž (pásmo je symetrické),
                     // u SSB je šířka rovnou vzdálenost hrany od nosné.
                     let bw = match self.set.mode {
-                        dsp::Mode::Am | dsp::Mode::Cw => d.abs() * 2.0,
+                        dsp::Mode::Am | dsp::Mode::Cw | dsp::Mode::Nfm => d.abs() * 2.0,
                         dsp::Mode::Usb => d,
                         dsp::Mode::Lsb => -d,
+                        // WFM hrany nejsou tažné (draggable_edges je prázdné),
+                        // sem se nedostane; šířku nech být.
+                        dsp::Mode::Wfm => self.bandwidth_hz(),
                     };
                     self.set_bandwidth_hz(bw);
                 } else {
@@ -1164,11 +1393,29 @@ fn squelch_line_db(bins: &[f32], span_hz: f64, bandwidth_hz: f64, squelch_db: f3
 ///
 /// Výřez se drží naladěné stanice, ale zastaví se u kraje zachyceného
 /// spektra - za ním nejsou data, tak nemá smysl tam koukat.
-fn view_window(zoom: f32, offset_hz: f64, span_hz: f64) -> (f64, f64) {
+fn view_window(zoom: f32, center_hz: f64, span_hz: f64) -> (f64, f64) {
     let zoom = zoom.clamp(1.0, MAX_ZOOM) as f64;
     let vis = span_hz / zoom;
     let limit = (span_hz - vis) / 2.0;
-    (offset_hz.clamp(-limit, limit), vis)
+    (center_hz.clamp(-limit, limit), vis)
+}
+
+/// Nový střed výřezu tak, aby naladěná frekvence `offset_hz` byla vidět.
+///
+/// Dokud je značka uvnitř prostředních ~90 % průzoru (`vis` široký), střed se
+/// nehne - spektrum stojí a značka se po něm posouvá. Teprve když by značka
+/// vyjela, střed ji dožene právě k okraji. Za zachycené spektrum se nepustí.
+/// Právě tohle drží ladění při zoomu stejně srozumitelné jako bez něj.
+fn pan_view_center(offset_hz: f64, view_center_hz: f64, vis: f64, span_hz: f64) -> f64 {
+    let margin = vis * 0.45;
+    let mut c = view_center_hz;
+    if offset_hz < c - margin {
+        c = offset_hz + margin;
+    } else if offset_hz > c + margin {
+        c = offset_hz - margin;
+    }
+    let limit = ((span_hz - vis) / 2.0).max(0.0);
+    c.clamp(-limit, limit)
 }
 
 /// Nový offset po kroku VFO tak, aby naladění zůstalo na stejné absolutní
@@ -1305,6 +1552,7 @@ impl eframe::App for App {
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     if let Ok(v) = self.vfo_input.trim().replace(',', ".").parse::<f64>() {
                         self.set_vfo(v);
+                        self.center_view_on_tuned();
                     }
                 }
                 if ui
@@ -1317,9 +1565,15 @@ impl eframe::App for App {
                 {
                     self.jump_window(span_hz, -1.0);
                 }
-                for d in [-10.0, -1.0, 1.0, 10.0] {
+                for &d in self.vfo_steps_khz() {
+                    // Velké skoky ukazuj v MHz, ať tlačítko není "+1000 k".
+                    let label = if d.abs() >= 1000.0 {
+                        format!("{:+.0} M", d / 1000.0)
+                    } else {
+                        format!("{d:+.0} k")
+                    };
                     if ui
-                        .button(format!("{d:+.0} k"))
+                        .button(label)
                         .on_hover_text("posune okno, naladěná stanice zůstane")
                         .clicked()
                     {
@@ -1351,8 +1605,25 @@ impl eframe::App for App {
                     );
                 }
                 ui.separator();
-                for m in [dsp::Mode::Am, dsp::Mode::Usb, dsp::Mode::Lsb, dsp::Mode::Cw] {
-                    ui.selectable_value(&mut self.set.mode, m, m.label());
+                for m in [
+                    dsp::Mode::Am,
+                    dsp::Mode::Usb,
+                    dsp::Mode::Lsb,
+                    dsp::Mode::Cw,
+                    dsp::Mode::Nfm,
+                    dsp::Mode::Wfm,
+                ] {
+                    // WFM má smysl jen na širokopásmovém vstupu (RSP1); na
+                    // krátkovlnném SoftRocku by z 96 kHz FM nešla, tak ho zašedni.
+                    let ok = !m.is_wfm() || self.set.hardware == source::Hardware::Rsp1;
+                    let resp = ui
+                        .add_enabled_ui(ok, |ui| {
+                            ui.selectable_value(&mut self.set.mode, m, m.label())
+                        })
+                        .inner;
+                    if m.is_wfm() && !ok {
+                        resp.on_hover_text("WFM potřebuje širokopásmové rádio (RSP1)");
+                    }
                 }
                 ui.separator();
                 self.s_meter(ui);
@@ -1367,6 +1638,39 @@ impl eframe::App for App {
             });
             ui.add_space(2.0);
             ui.horizontal(|ui| {
+                // Přepínač rádia - přepne se hned za běhu, bez restartu.
+                ui.label("rádio:");
+                let mut switch_hw = None;
+                egui::ComboBox::from_id_salt("hw_top")
+                    .selected_text(self.set.hardware.label())
+                    .show_ui(ui, |ui| {
+                        for hw in source::Hardware::ALL {
+                            let vybrano = self.set.hardware == hw;
+                            if hw.available() {
+                                if ui.selectable_label(vybrano, hw.label()).clicked() && !vybrano {
+                                    switch_hw = Some(hw);
+                                }
+                            } else {
+                                ui.add_enabled_ui(false, |ui| {
+                                    let _ = ui.selectable_label(vybrano, hw.label());
+                                })
+                                .response
+                                .on_hover_text("není v tomhle sestavení - chce Linux a feature `rsp1`");
+                            }
+                        }
+                    });
+                if let Some(hw) = switch_hw {
+                    self.set.hardware = hw;
+                    // Nové rádio má jiný rozsah - přeladit do něj, ať SoftRock
+                    // nezůstane viset na kmitočtu, kam dosáhne jen RSP1.
+                    self.set_vfo(self.set.vfo_khz);
+                    // SoftRock WFM neumí - přepni na AM, ať nezní šum z prázdné FM.
+                    if self.set.mode.is_wfm() && hw != source::Hardware::Rsp1 {
+                        self.set.mode = dsp::Mode::Am;
+                    }
+                    self.request_reopen();
+                }
+                ui.separator();
                 ui.label("hlasitost:");
                 ui.add(egui::Slider::new(&mut self.set.volume, 0.0..=1.0).show_value(false));
                 ui.separator();
@@ -1383,19 +1687,22 @@ impl eframe::App for App {
                     self.show_options = !self.show_options;
                 }
                 ui.separator();
-                let (bw_min, bw_max) = radio::bandwidth_range(self.set.mode);
-                let mut bw_khz = self.bandwidth_hz() / 1000.0;
-                if ui
-                    .add(
-                        egui::Slider::new(&mut bw_khz, bw_min / 1000.0..=bw_max / 1000.0)
-                            .text("šířka [kHz]")
-                            .fixed_decimals(1),
-                    )
-                    .changed()
-                {
-                    self.set_bandwidth_hz(bw_khz * 1000.0);
+                // WFM má kanál pevný, posuvník šířky by nedělal nic.
+                if !self.set.mode.is_wfm() {
+                    let (bw_min, bw_max) = radio::bandwidth_range(self.set.mode);
+                    let mut bw_khz = self.bandwidth_hz() / 1000.0;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut bw_khz, bw_min / 1000.0..=bw_max / 1000.0)
+                                .text("šířka [kHz]")
+                                .fixed_decimals(1),
+                        )
+                        .changed()
+                    {
+                        self.set_bandwidth_hz(bw_khz * 1000.0);
+                    }
+                    ui.separator();
                 }
-                ui.separator();
                 ui.label("zoom:");
                 if ui.button("−").clicked() {
                     self.set_zoom(self.set.zoom / 2.0);
@@ -1758,6 +2065,43 @@ mod tests {
     use super::*;
 
     const SPAN: f64 = 96_000.0;
+
+    /// Dokud je značka uvnitř průzoru, spektrum se nesmí hnout - to byl přesně
+    /// ten zmatek: při zoomu se výřez pořád vycentrovával a spektrum trhalo.
+    #[test]
+    fn vyrez_stoji_dokud_je_znacka_uvnitr() {
+        let vis = SPAN / 8.0; // zoom 8
+        let center = 0.0;
+        // Malé doladění blízko středu nesmí pohnout výřezem.
+        assert_eq!(pan_view_center(500.0, center, vis, SPAN), center);
+        assert_eq!(pan_view_center(-500.0, center, vis, SPAN), center);
+        // Až u kraje (nad 45 % z poloviny šířky) se dožene.
+        let margin = vis * 0.45;
+        assert_eq!(pan_view_center(margin, center, vis, SPAN), center);
+        let far = margin + 1_000.0;
+        let moved = pan_view_center(far, center, vis, SPAN);
+        assert!(moved > center, "výřez se u kraje musí posunout za značkou");
+        // A posune se právě tak, aby značka seděla na okraji.
+        assert!((far - moved - margin).abs() < 1e-6);
+    }
+
+    /// Při zoomu 1 je výřez celé spektrum, takže jeho střed je vždy 0 -
+    /// značka se pohybuje po stojícím spektru (chování bez zoomu).
+    #[test]
+    fn bez_zoomu_vyrez_stoji_na_stredu() {
+        assert_eq!(pan_view_center(30_000.0, 0.0, SPAN, SPAN), 0.0);
+        assert_eq!(pan_view_center(-40_000.0, 10_000.0, SPAN, SPAN), 0.0);
+    }
+
+    /// Střed výřezu se nikdy nedostane za zachycené spektrum.
+    #[test]
+    fn pan_stredu_nevyjede_ze_spektra() {
+        let vis = SPAN / 4.0;
+        let limit = (SPAN - vis) / 2.0;
+        // Značka až u kraje spektra: střed se zarazí na mezi, ne dál.
+        let c = pan_view_center(SPAN / 2.0, 0.0, vis, SPAN);
+        assert!(c <= limit + 1e-6, "střed {c} přesáhl mez {limit}");
+    }
 
     /// Panorama ze samého šumu s volitelnými špičkami na daných offsetech.
     fn bins_with(peaks: &[(f64, f32)]) -> Vec<f32> {
