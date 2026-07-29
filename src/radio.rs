@@ -46,6 +46,13 @@ pub fn bandwidth_range(mode: Mode) -> (f64, f64) {
     }
 }
 
+/// Meze posuvníku šumové brány v dBFS. Kryjí rozsah S-metru, aby šla čára
+/// squelche postavit kamkoli mezi šumové dno a silný signál.
+pub const SQUELCH_MIN_DB: f32 = -100.0;
+pub const SQUELCH_MAX_DB: f32 = -20.0;
+/// Výchozí práh šumové brány - kousek nad typickým šumovým dnem.
+pub const DEFAULT_SQUELCH_DB: f32 = -70.0;
+
 /// Nejužší poctivý CW filtr. Změřeno: kanálový filtr na 48 kHz s 1023
 /// koeficienty trefí -6 dB bod na hertz přesně až sem; při 100 Hz už
 /// vyjde 58 místo 50 Hz.
@@ -67,6 +74,8 @@ pub struct Controls {
     pub rtty: RttyConfig,
     /// Squelch CW v dB nad šumovým dnem.
     pub cw_squelch_db: f32,
+    /// Práh šumové brány zvuku v dBFS, nebo `None` když je vypnutá.
+    pub squelch_db: Option<f32>,
 }
 
 impl Default for Controls {
@@ -80,6 +89,7 @@ impl Default for Controls {
             decoder: Decoder::Off,
             rtty: RttyConfig::default(),
             cw_squelch_db: crate::decode::CW_SQUELCH_DB,
+            squelch_db: None,
         }
     }
 }
@@ -242,7 +252,7 @@ fn run(
             continue;
         }
 
-        let (offset, volume, swap, bandwidth, mode, decoder, rtty, squelch) = {
+        let (offset, volume, swap, bandwidth, mode, decoder, rtty, squelch, audio_squelch) = {
             let c = shared.controls.lock().unwrap();
             (
                 c.offset_hz,
@@ -253,12 +263,14 @@ fn run(
                 c.decoder,
                 c.rtty,
                 c.cw_squelch_db,
+                c.squelch_db,
             )
         };
         rx.set_offset(offset);
         rx.set_mode(mode);
         rx.set_bandwidth(bandwidth);
         rx.set_decoder(decoder, rtty, squelch);
+        rx.set_squelch(audio_squelch);
 
         iq.clear();
         iq.extend(raw[..frames].iter().map(|c| {

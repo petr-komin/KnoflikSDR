@@ -560,6 +560,11 @@ impl App {
             ..Default::default()
         };
         c.cw_squelch_db = self.set.cw_squelch_db;
+        c.squelch_db = if self.set.squelch_on {
+            Some(self.set.squelch_db)
+        } else {
+            None
+        };
     }
 
     /// Konzole s textem z dekodéru.
@@ -1599,6 +1604,21 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 self.s_meter(ui);
+                // Šumová brána hned u S-metru - práh je ve stejné stupnici (dBFS),
+                // takže je vidět, kam vůči síle signálu čáru squelche stavíš.
+                ui.checkbox(&mut self.set.squelch_on, "squelch")
+                    .on_hover_text("umlčí zvuk, když signál klesne pod práh - ať mezi stanicemi nesyčí");
+                ui.add_enabled_ui(self.set.squelch_on, |ui| {
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.set.squelch_db,
+                            radio::SQUELCH_MIN_DB..=radio::SQUELCH_MAX_DB,
+                        )
+                        .fixed_decimals(0)
+                        .suffix(" dBFS"),
+                    )
+                    .on_hover_text("práh brány (oranžová čára v panoramatu) - výš = otevře jen silnější signál");
+                });
                 ui.separator();
                 if ui
                     .button("⌖ nejsilnější")
@@ -1889,6 +1909,27 @@ impl eframe::App for App {
                         egui::Color32::from_rgb(255, 210, 60),
                     );
                 }
+            }
+
+            // Šumová brána zvuku: pod touhle čárou se zvuk umlčí. Práh je v
+            // dBFS - stejná stupnice jako panorama i S-metr - tak leží přímo
+            // na dB ose. Čára jde přes propustné pásmo, kterého se squelch týká.
+            if self.set.squelch_on {
+                let t = ((self.set.squelch_db - self.set.db_min)
+                    / (self.set.db_max - self.set.db_min))
+                    .clamp(0.0, 1.0);
+                let y = rect.bottom() - rect.height() * t;
+                painter.line_segment(
+                    [egui::pos2(bw_rect.left(), y), egui::pos2(bw_rect.right(), y)],
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 130, 40)),
+                );
+                painter.text(
+                    egui::pos2(bw_rect.left() + 2.0, y - 1.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    "squelch",
+                    egui::FontId::proportional(9.0),
+                    egui::Color32::from_rgb(255, 130, 40),
+                );
             }
 
             // Kreslíme jen biny uvnitř výřezu - jinak by se při zoomu počítaly

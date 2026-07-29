@@ -84,6 +84,11 @@ pub struct Settings {
     pub rtty_reverse: bool,
     /// Squelch CW: o kolik dB musí signál vyčnívat nad šum, aby se dekódoval.
     pub cw_squelch_db: f32,
+    /// Šumová brána zvuku zapnutá? Platí pro všechny režimy.
+    pub squelch_on: bool,
+    /// Práh šumové brány v dBFS - pod ním se zvuk umlčí. Stejná stupnice
+    /// jako S-metr.
+    pub squelch_db: f32,
     pub show_console: bool,
     pub stations: Vec<Station>,
     /// Poslední místo na každém pásmu, klíčem je název z bandplanu.
@@ -120,6 +125,8 @@ impl Default for Settings {
             decoder: Decoder::Off,
             rtty_reverse: false,
             cw_squelch_db: crate::decode::CW_SQUELCH_DB,
+            squelch_on: false,
+            squelch_db: crate::radio::DEFAULT_SQUELCH_DB,
             show_console: false,
             stations: Vec::new(),
             band_memory: BTreeMap::new(),
@@ -328,6 +335,8 @@ mod tests {
             decoder: Decoder::Rtty,
             rtty_reverse: true,
             cw_squelch_db: 14.0,
+            squelch_on: true,
+            squelch_db: -65.0,
             show_console: true,
             band_memory: BTreeMap::new(),
             stations: vec![

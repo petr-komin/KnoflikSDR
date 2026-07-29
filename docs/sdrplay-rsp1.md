@@ -29,8 +29,10 @@ souvisle do 2 GHz** (ověřeno: `set_frequency` projde a streamuje na 145, 300, 
 1296 MHz; korelace spekter na 145/150/155 je 0,1-0,4, tedy opravdu ladí, neořezává).
 Proto jsou v bandplanu i 2 m, 70 cm a 23 cm a strop ladění je 2 GHz.
 
-> **Poznámka k S-metru a šumu:** NFM ani WFM nemají squelch, takže na prázdném kanálu jde
-> ven zesílený šum. Squelch je zjevný další krok.
+> **Poznámka k S-metru a šumu:** šumová brána (squelch) na panelu platí pro všechny režimy
+> včetně NFM i WFM — umlčí zvuk, když síla naladěného signálu klesne pod nastavený práh
+> (v dBFS, stejná stupnice jako S-metr), takže na prázdném kanálu už nejde ven zesílený šum.
+> Práh se kreslí do panoramatu jako vodorovná oranžová čára přes propustné pásmo.
 
 > Tenhle dokument je **jen o SDRplay RSP1**. Provoz SoftRocku na slabším stroji
 > (typicky Raspberry Pi) s tímhle nesouvisí a je popsaný v

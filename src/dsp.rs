@@ -283,6 +283,83 @@ impl Agc {
     }
 }
 
+/// Hystereze squelche v dB. Otevře se o kus výš, než zavře, ať brána na
+/// hraně prahu nekmitá, když signál kolísá kolem něj.
+const SQUELCH_HYST_DB: f32 = 2.0;
+
+/// Šumová brána. Umlčí zvuk, když síla naladěného signálu klesne pod práh -
+/// jinak by mezi stanicemi jen syčel šum do sluchátek. Práh je v dBFS, tedy
+/// ve stejné stupnici, jakou ukazuje S-metr (`Demod::level_dbfs`), takže čára
+/// v panoramatu sedí na to, co metr měří.
+///
+/// Rozhoduje se z obálky před AGC (té samé, ze které se bere S-metr), ne z
+/// hlasitosti po AGC - ta by slabý šum vytáhla na úroveň signálu a brána by
+/// nikdy nezavřela.
+pub struct Squelch {
+    /// Práh otevření a zavření v lineární amplitudě (dBFS převedené na 10^(dB/20)).
+    /// `None` = squelch vypnutý, zvuk projde vždy.
+    open_lin: Option<f32>,
+    close_lin: f32,
+    /// Aktuální zisk brány 0..1. Mění se plynule, aby přechod necvakl.
+    gain: f32,
+    /// Přírůstek zisku na jeden vzorek (náběh i doběh).
+    ramp: f32,
+    /// Je brána otevřená? Drží se přes hysterezi.
+    open: bool,
+}
+
+impl Squelch {
+    pub fn new(sample_rate: f32) -> Self {
+        Squelch {
+            open_lin: None,
+            close_lin: 0.0,
+            gain: 1.0,
+            // ~10 ms náběh/doběh - dost rychlé, aby neukously začátek slova,
+            // a dost pomalé, aby otevření/zavření nelusklo.
+            ramp: 1.0 / (0.010 * sample_rate),
+            open: true,
+        }
+    }
+
+    /// Nastaví práh v dBFS, nebo `None` pro vypnutí. Práh se převádí na
+    /// lineární amplitudu, ať se v `gate` neloguje na každém vzorku.
+    pub fn set_threshold(&mut self, db: Option<f32>) {
+        match db {
+            Some(thr) => {
+                self.open_lin = Some(10f32.powf((thr + SQUELCH_HYST_DB / 2.0) / 20.0));
+                self.close_lin = 10f32.powf((thr - SQUELCH_HYST_DB / 2.0) / 20.0);
+            }
+            None => {
+                self.open_lin = None;
+                // Vypnutý squelch nechá bránu dojet naplno otevřenou.
+                self.open = true;
+            }
+        }
+    }
+
+    /// Aktualizuje bránu podle aktuální síly signálu (lineární obálka před AGC)
+    /// a vrátí vzorek přiškrcený aktuálním ziskem brány.
+    #[inline]
+    pub fn gate(&mut self, level_lin: f32, x: f32) -> f32 {
+        if let Some(open_lin) = self.open_lin {
+            if self.open {
+                if level_lin < self.close_lin {
+                    self.open = false;
+                }
+            } else if level_lin > open_lin {
+                self.open = true;
+            }
+        }
+        let target = if self.open { 1.0 } else { 0.0 };
+        if self.gain < target {
+            self.gain = (self.gain + self.ramp).min(target);
+        } else if self.gain > target {
+            self.gain = (self.gain - self.ramp).max(target);
+        }
+        x * self.gain
+    }
+}
+
 /// Šířka FM rozhlasového kanálu (Carson: 2×(75 kHz zdvih + 15 kHz audio)).
 const FM_CHANNEL_HZ: f64 = 180_000.0;
 /// Maximální zdvih FM rozhlasu - podle něj se diskriminátor normuje na ±1.
@@ -379,8 +456,9 @@ impl WfmDemod {
     }
 
     /// Vstup je už smíšený na offset NCO (stejně jako u ostatních režimů),
-    /// takže sem chodí pásmo se stanicí kolem DC.
-    fn process(&mut self, mixed: Complex32, out: &mut Vec<f32>) {
+    /// takže sem chodí pásmo se stanicí kolem DC. `squelch` hradluje výstup
+    /// stejně jako u ostatních režimů - u FM podle síly nosné na mezifrekvenci.
+    fn process(&mut self, mixed: Complex32, out: &mut Vec<f32>, squelch: &mut Squelch) {
         let Some(z) = self.if_lp.push(mixed) else {
             return;
         };
@@ -399,7 +477,8 @@ impl WfmDemod {
         self.deemph_y += self.deemph_a * (demod - self.deemph_y);
 
         if let Some(a) = self.audio_lp.push(Complex32::new(self.deemph_y, 0.0)) {
-            out.push(self.dc.push(a.re));
+            let s = self.dc.push(a.re);
+            out.push(squelch.gate(self.level, s));
         }
     }
 
@@ -419,6 +498,8 @@ pub struct Demod {
     bfo: Nco,
     dc: DcBlock,
     agc: Agc,
+    /// Šumová brána na výstupu. Společná pro všechny režimy.
+    squelch: Squelch,
     /// Širokopásmová FM. Vlastní řetězec s vlastní decimací; drží se pořád,
     /// zapojí se jen v režimu WFM.
     wfm: WfmDemod,
@@ -476,6 +557,7 @@ impl Demod {
             bfo,
             dc: DcBlock::new(0.995),
             agc: Agc::new(out_rate as f32),
+            squelch: Squelch::new(out_rate as f32),
             wfm: WfmDemod::new(in_rate, decim),
             nfm_last: Complex32::new(0.0, 0.0),
             nfm_lp: 0.0,
@@ -550,6 +632,12 @@ impl Demod {
         }
     }
 
+    /// Nastaví práh šumové brány v dBFS (stejná stupnice jako S-metr),
+    /// nebo `None` pro vypnutí squelche.
+    pub fn set_squelch(&mut self, db: Option<f32>) {
+        self.squelch.set_threshold(db);
+    }
+
     /// Úroveň naladěného signálu v dBFS (před AGC). Pro S-metr.
     pub fn level_dbfs(&self) -> f32 {
         match self.mode {
@@ -574,7 +662,7 @@ impl Demod {
         if self.mode.is_wfm() {
             for &x in iq {
                 let mixed = x * self.nco.next();
-                self.wfm.process(mixed, out);
+                self.wfm.process(mixed, out, &mut self.squelch);
             }
             return;
         }
@@ -623,7 +711,15 @@ impl Demod {
                     Mode::Wfm => unreachable!("WFM má vlastní řetězec"),
                 };
                 let audio = self.dc.push(detected);
-                out.push(self.agc.push(audio));
+                let s = self.agc.push(audio);
+                // Squelch bere sílu z obálky před AGC - té samé, ze které se
+                // počítá S-metr. NFM má vlastní obálku (nosná je konstantní),
+                // ostatní režimy berou obálku AGC.
+                let level = match self.mode {
+                    Mode::Nfm => self.nfm_level,
+                    _ => self.agc.envelope(),
+                };
+                out.push(self.squelch.gate(level, s));
             }
         }
     }
@@ -687,6 +783,55 @@ mod pre_taps_tests {
 }
 
 #[cfg(test)]
+mod squelch_tests {
+    use super::*;
+
+    /// Ustálený zisk brány po dost dlouhém přivádění dané úrovně.
+    fn settle(sq: &mut Squelch, level_lin: f32) -> f32 {
+        let mut g = 0.0;
+        // 0,1 s na 48 kHz bohatě stačí na 10ms rampu.
+        for _ in 0..4800 {
+            g = sq.gate(level_lin, 1.0);
+        }
+        g
+    }
+
+    /// Nad prahem musí brána naplno otevřít, hluboko pod ním úplně zavřít.
+    #[test]
+    fn otevre_nad_prahem_zavre_pod_nim() {
+        let mut sq = Squelch::new(48_000.0);
+        sq.set_threshold(Some(-40.0)); // ~0,01 lineárně
+
+        // Signál 20 dB nad prahem -> plně otevřeno.
+        assert!(settle(&mut sq, 0.1) > 0.99, "silný signál má bránu otevřít");
+        // Signál 20 dB pod prahem -> plně zavřeno (ticho do sluchátek).
+        assert!(settle(&mut sq, 0.001) < 0.01, "slabý šum má bránu zavřít");
+    }
+
+    /// Vypnutý squelch nesmí zvuk nikdy přiškrtit, ani při nulové úrovni.
+    #[test]
+    fn vypnuty_squelch_pousti_vzdy() {
+        let mut sq = Squelch::new(48_000.0);
+        sq.set_threshold(None);
+        assert!((settle(&mut sq, 0.0) - 1.0).abs() < 1e-6);
+    }
+
+    /// Hystereze: signál kousek nad prahem otevře, pak musí spadnout znatelně
+    /// níž, aby zavřel - u samotného prahu brána nekmitá.
+    #[test]
+    fn hystereze_drzi_branu_stabilni() {
+        let mut sq = Squelch::new(48_000.0);
+        sq.set_threshold(Some(-40.0));
+        let thr = 10f32.powf(-40.0 / 20.0); // lineární práh
+
+        // Otevři silným signálem.
+        assert!(settle(&mut sq, 10.0 * thr) > 0.99);
+        // Přesně na prahu (uvnitř hystereze) musí zůstat otevřeno.
+        assert!(settle(&mut sq, thr) > 0.99, "na prahu se nesmí zavřít");
+    }
+}
+
+#[cfg(test)]
 mod wfm_tests {
     use super::*;
     use std::f64::consts::PI;
@@ -722,6 +867,8 @@ mod wfm_tests {
         let in_rate = 1_344_000.0;
         let decim = 28; // -> 48 kHz
         let mut wfm = WfmDemod::new(in_rate, decim);
+        // Squelch pro tenhle test vypnutý - ověřujeme demodulaci, ne bránu.
+        let mut sq = Squelch::new(48_000.0);
 
         let tone_hz = 1_000.0; // modulační tón
         let dev_hz = 40_000.0; // zdvih
@@ -737,7 +884,7 @@ mod wfm_tests {
             phase += 2.0 * PI * f / in_rate;
             tphase += tone_hz / in_rate;
             let iq = Complex32::new(phase.cos() as f32, phase.sin() as f32);
-            wfm.process(iq, &mut out);
+            wfm.process(iq, &mut out, &mut sq);
         }
 
         assert!(out.len() > 4096, "málo audio vzorků: {}", out.len());

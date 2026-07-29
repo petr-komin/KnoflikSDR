@@ -16,6 +16,8 @@ jeden statický binár místo Pythonu s C rozšířením.
 - **Příjem AM, USB, LSB a CW** z I/Q; **WFM** (VKV rozhlas) a **NFM** (2 m/70 cm) na RSP1
 - **Ladění Si570** přes USB, bez proprietárních knihoven
 - **Panorama a vodopád** přes celou vzorkovací frekvenci, s mřížkou v dB a kHz
+- **Šumová brána (squelch)** pro všechny režimy — umlčí zvuk pod nastaveným prahem, ať mezi
+  stanicemi nesyčí; práh je vidět jako vodorovnou čáru v panoramatu
 - **Bandplan i pro VKV/UHF** — s RSP1 se ladí souvisle do 2 GHz; vyznačená amatérská pásma
   6 m / 2 m / 70 cm / 23 cm, FM rozhlas i orientační DAB/DVB-T
 - **Velké skoky ladění** — na RSP1 tlačítka ±10 k / ±100 k / ±1 M kHz, na SoftRocku jemná
