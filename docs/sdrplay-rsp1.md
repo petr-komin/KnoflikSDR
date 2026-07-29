@@ -330,9 +330,15 @@ byly vidět v `SoapySDRUtil --probe` i v gr-osmosdr. Na **1,344 MSps** je to 4,0
 
 - **Poslechnout AM/SSB.** WFM i NFM jsou ověřené (`wfm_ze_stanice`, `nfm_z_vysilani`), ale že
   z RSP1 leze srozumitelné **AM/SSB na KV**, ověřeno automaticky **není** - jen že vzorky tečou.
-- **Squelch pro FM.** WFM ani NFM ho nemají, takže prázdný kanál syčí zesíleným šumem. Nejvíc
-  chybějící věc pro reálný poslech 2 m/70 cm.
-- **WFM stereo a RDS** by byl další krok (pilot 19 kHz, RDS na 57 kHz). Teď je WFM mono.
+- ~~**Squelch pro FM.**~~ **Hotovo 29. 7. 2026:** šumová brána v `dsp.rs` (`Squelch`) platí pro
+  všechny režimy včetně WFM a NFM, práh v dBFS se ovládá u S-metru a kreslí se do panoramatu.
+  Prázdný kanál už zesílený šum nepouští.
+- ~~**WFM stereo a RDS.**~~ **Hotovo 29. 7. 2026:** podnosná 38 kHz se odvozuje umocněním
+  pilotu (`cos 2θ = 2cos²θ − 1`), RDS nosná 57 kHz z něj vyjde jako `cos 3θ`. Zvuková cesta
+  je nově prokládané stereo (mono režimy dávají do obou kanálů totéž). Ověřeno testy na
+  syntetickém multiplexu (`stereo_oddeli_kanaly`) a syntetických RDS skupinách
+  (`precte_nazev_stanice_z_vyrobeneho_signalu`). **Na skutečném vysílání zatím neposlechnuto** -
+  hlavně kvalita stereo oddělení a záchyt RDS při slabším signálu je věc éteru, ne testu.
 - **Zisk 0–10,2 dB na slabé signály** (§6.4). Když nebude stačit, je to důvod na libmirisdr přímo.
 - **IF filtry MSi001** (§7). Nevíme, jestli se nastaví samy podle vzorkovačky. Kdyby ne, leze
   do 672 kHz okolo aliasing zvenčí — antialiasingová propust v `dsp.rs` řeší jen decimaci,

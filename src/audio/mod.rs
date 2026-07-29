@@ -167,10 +167,12 @@ fn run_playback(
     let mut buf = vec![0f32; CHUNK * 2];
     while running.load(Ordering::Relaxed) {
         for f in 0..CHUNK {
+            // Z ringu chodí rovnou prokládané L, R - mono režimy tam dávají
+            // dvakrát totéž. Vzorky se do něj vkládají po dvojicích, takže se
+            // kanály nemůžou prohodit ani když ring přeteče.
             // Prázdný ring = ticho. Nemá smysl čekat, výstup si drží tempo sám.
-            let s = audio_rx.pop().unwrap_or(0.0);
-            buf[f * 2] = s;
-            buf[f * 2 + 1] = s;
+            buf[f * 2] = audio_rx.pop().unwrap_or(0.0);
+            buf[f * 2 + 1] = audio_rx.pop().unwrap_or(0.0);
         }
         out.write(&buf)?;
     }

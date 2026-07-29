@@ -6,7 +6,7 @@
 use crate::audio::{self, Depth};
 use crate::decode::Decoder;
 use crate::source::Hardware;
-use crate::dsp::Mode;
+use crate::dsp::{AgcMode, Mode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -69,6 +69,8 @@ pub struct Settings {
     pub bandwidth_ssb_hz: f64,
     pub bandwidth_cw_hz: f64,
     pub bandwidth_nfm_hz: f64,
+    /// Šířka mezifrekvenční propusti u VKV rozhlasu.
+    pub bandwidth_wfm_hz: f64,
     pub volume: f32,
     pub swap_iq: bool,
     pub db_min: f32,
@@ -89,7 +91,19 @@ pub struct Settings {
     /// Práh šumové brány v dBFS - pod ním se zvuk umlčí. Stejná stupnice
     /// jako S-metr.
     pub squelch_db: f32,
+    /// Rychlost AGC (rychlá/střední/pomalá), případně vypnutá.
+    pub agc: AgcMode,
+    /// Ruční zisk v dB při vypnuté AGC.
+    pub agc_manual_db: f32,
+    /// Ruční zádrž na heterodyn zapnutá?
+    pub notch_on: bool,
+    /// Kmitočet zádrže v Hz (v audio pásmu).
+    pub notch_hz: f64,
+    /// Přehrávat VKV rozhlas ve stereu? Bez pilotu se stejně jede mono.
+    pub stereo: bool,
     pub show_console: bool,
+    /// Je rozbalená sekce se zvukem a skenováním?
+    pub show_audio_row: bool,
     pub stations: Vec<Station>,
     /// Poslední místo na každém pásmu, klíčem je název z bandplanu.
     /// BTreeMap kvůli stabilnímu pořadí v souboru.
@@ -114,6 +128,7 @@ impl Default for Settings {
             bandwidth_ssb_hz: crate::radio::SSB_BANDWIDTH_HZ,
             bandwidth_cw_hz: crate::radio::CW_BANDWIDTH_HZ,
             bandwidth_nfm_hz: crate::radio::NFM_BANDWIDTH_HZ,
+            bandwidth_wfm_hz: crate::radio::WFM_BANDWIDTH_HZ,
             volume: 0.5,
             swap_iq: false,
             db_min: -110.0,
@@ -127,7 +142,13 @@ impl Default for Settings {
             cw_squelch_db: crate::decode::CW_SQUELCH_DB,
             squelch_on: false,
             squelch_db: crate::radio::DEFAULT_SQUELCH_DB,
+            agc: AgcMode::default(),
+            agc_manual_db: crate::radio::DEFAULT_AGC_MANUAL_DB,
+            notch_on: false,
+            notch_hz: 1_000.0,
+            stereo: true,
             show_console: false,
+            show_audio_row: true,
             stations: Vec::new(),
             band_memory: BTreeMap::new(),
         }
@@ -142,8 +163,7 @@ impl Settings {
             Mode::Usb | Mode::Lsb => self.bandwidth_ssb_hz,
             Mode::Am => self.bandwidth_am_hz,
             Mode::Nfm => self.bandwidth_nfm_hz,
-            // WFM má kanál pevný, šířka se neukládá ani neladí.
-            Mode::Wfm => crate::radio::bandwidth_range(Mode::Wfm).0,
+            Mode::Wfm => self.bandwidth_wfm_hz,
         }
     }
 
@@ -153,7 +173,7 @@ impl Settings {
             Mode::Usb | Mode::Lsb => self.bandwidth_ssb_hz = bw,
             Mode::Am => self.bandwidth_am_hz = bw,
             Mode::Nfm => self.bandwidth_nfm_hz = bw,
-            Mode::Wfm => {}
+            Mode::Wfm => self.bandwidth_wfm_hz = bw,
         }
     }
 }
@@ -324,6 +344,7 @@ mod tests {
             bandwidth_ssb_hz: 2400.0,
             bandwidth_cw_hz: 500.0,
             bandwidth_nfm_hz: 16_000.0,
+            bandwidth_wfm_hz: 150_000.0,
             volume: 0.33,
             swap_iq: true,
             db_min: -120.0,
@@ -337,7 +358,13 @@ mod tests {
             cw_squelch_db: 14.0,
             squelch_on: true,
             squelch_db: -65.0,
+            agc: AgcMode::Slow,
+            agc_manual_db: 30.0,
+            notch_on: true,
+            notch_hz: 1_200.0,
+            stereo: false,
             show_console: true,
+            show_audio_row: false,
             band_memory: BTreeMap::new(),
             stations: vec![
                 Station {
@@ -443,7 +470,7 @@ mod tests {
     }
 
     /// Se zavřenou konzolí nemá dekodér co dělat - text by nikdo neviděl
-    /// a squelch by se kreslil do spektra bez důvodu.
+    /// a jeho práh by se kreslil do spektra bez důvodu.
     #[test]
     fn volba_dekoderu_prezije_zavreni_konzole() {
         let mut s = Settings::default();

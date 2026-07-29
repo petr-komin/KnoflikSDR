@@ -8,6 +8,8 @@ mod bandplan;
 mod decode;
 mod dsp;
 mod radio;
+mod rds;
+mod record;
 mod settings;
 mod schedule;
 mod si570;
@@ -51,8 +53,9 @@ fn main() -> eframe::Result {
     // Nastavení nese i zvuková zařízení, takže ho potřebujeme před vlákny.
     let saved = Settings::load();
 
-    // Audio ring: ~0.5 s rezerva na 48 kHz.
-    let (audio_tx, audio_rx) = rtrb::RingBuffer::<f32>::new(24_000);
+    // Audio ring: ~0.5 s rezerva na 48 kHz. Zvuk teče jako prokládané dvojice
+    // L, R, takže na jeden rámec padnou dva f32 - odtud dvojnásobek.
+    let (audio_tx, audio_rx) = rtrb::RingBuffer::<f32>::new(48_000);
 
     audio::spawn(
         audio_rx,
@@ -257,6 +260,46 @@ struct App {
     wf_tex: Option<egui::TextureHandle>,
     last_generation: u64,
     autosave: Autosave,
+    /// Běžící skener, nebo `None`. Neukládá se - po startu se nikdy neskenuje.
+    scan: Option<Scan>,
+}
+
+/// Co skener projíždí.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScanKind {
+    /// Oblíbené stanice i s jejich režimem a šířkou.
+    Favourites,
+    /// Viditelný výřez panoramatu krokem po šířce kanálu. Přelaďuje se jen
+    /// offset, ne VFO - je to tedy okamžité a funguje na obou rádiích.
+    Window,
+}
+
+impl ScanKind {
+    fn label(&self) -> &'static str {
+        match self {
+            ScanKind::Favourites => "oblíbené",
+            ScanKind::Window => "výřez",
+        }
+    }
+}
+
+/// Jak dlouho se stojí na jednom kanálu, než se jde dál. Musí to stačit na
+/// ustálení AGC i šumové brány, jinak by skener přelítl i otevřenou stanici.
+const SCAN_DWELL_MS: u64 = 350;
+/// Jak dlouho po ztichnutí stanice čekat, než se skenování rozjede zpátky.
+/// Krátká pauza v řeči nesmí skener poslat pryč.
+const SCAN_RESUME_MS: u64 = 2_000;
+
+/// Stav skeneru. Zastavuje se na signálu, který otevře šumovou bránu.
+struct Scan {
+    kind: ScanKind,
+    /// Pozice v seznamu oblíbených, nebo pořadí kanálu ve výřezu.
+    idx: usize,
+    /// Kdy skočit na další kanál (když se zrovna nestojí na signálu).
+    next_step: std::time::Instant,
+    /// Stojíme na signálu? A od kdy je zas ticho.
+    holding: bool,
+    quiet_since: Option<std::time::Instant>,
 }
 
 impl App {
@@ -288,6 +331,7 @@ impl App {
             wf_tex: None,
             last_generation: 0,
             autosave: Autosave::new(s),
+            scan: None,
         }
     }
 
@@ -565,6 +609,285 @@ impl App {
         } else {
             None
         };
+        c.agc = self.set.agc;
+        c.agc_manual_db = self.set.agc_manual_db;
+        c.notch_hz = if self.set.notch_on {
+            Some(self.set.notch_hz)
+        } else {
+            None
+        };
+        c.stereo = self.set.stereo;
+    }
+
+    /// Stereo u VKV rozhlasu. Název stanice a stav stereo se ukazují nahoře
+    /// u naladěné frekvence, RadioText dole ve stavovém řádku - sem patří
+    /// jen samotný přepínač.
+    fn wfm_controls(&mut self, ui: &mut egui::Ui) {
+        if !self.set.mode.is_wfm() {
+            return;
+        }
+        ui.checkbox(&mut self.set.stereo, "stereo")
+            .on_hover_text("zapne stereo, když je slyšet pilot 19 kHz\nbez pilotu hraje mono tak jako tak");
+    }
+
+    /// Kde v panoramatu leží tón, který notch zabíjí - offsety od VFO v Hz.
+    ///
+    /// Notch pracuje na audiu, ale uživatel se dívá na spektrum. Převod závisí
+    /// na režimu: u SSB je audio kmitočet přímo odstup od nosné (u LSB dolů),
+    /// u CW se do toho míchá BFO a u AM dává stejný tón nosná po obou stranách,
+    /// takže se značí obě.
+    fn notch_rf_offsets(&self) -> Vec<f64> {
+        let f = self.set.notch_hz;
+        let c = self.set.offset_hz;
+        match self.set.mode {
+            dsp::Mode::Usb => vec![c + f],
+            dsp::Mode::Lsb => vec![c - f],
+            // Obálkový detektor složí obě strany na stejný tón.
+            dsp::Mode::Am => vec![c - f, c + f],
+            // BFO posune nosnou z DC na CW_PITCH, tak jde tón zpátky o pitch.
+            dsp::Mode::Cw => vec![c + f - dsp::CW_PITCH_HZ],
+            // U FM je vztah audia a spektra nelineární, značka by lhala.
+            dsp::Mode::Nfm | dsp::Mode::Wfm => vec![],
+        }
+    }
+
+    /// Je na naladěném kanálu signál, který otevře šumovou bránu?
+    ///
+    /// Skener se rozhoduje podle stejné veličiny jako brána v DSP - úrovně
+    /// před AGC proti prahu v dBFS. Díky tomu zastaví přesně tam, kde se
+    /// ozve zvuk, a ne tam, kde jen povyskočí spektrum.
+    fn signal_open(&self) -> bool {
+        self.set.squelch_on && self.shared.level_dbfs() > self.set.squelch_db
+    }
+
+    /// Kolik kanálů má výřez při skenování krokem po šířce pásma.
+    fn scan_window_steps(&self, span_hz: f64) -> usize {
+        let (_, view_w) = self.view(span_hz);
+        let step = self.bandwidth_hz().max(100.0);
+        ((view_w / step).floor() as usize).max(1)
+    }
+
+    /// Přeladí na kanál s daným pořadím podle druhu skenování.
+    fn scan_goto(&mut self, idx: usize, span_hz: f64) {
+        match self.scan.as_ref().map(|s| s.kind) {
+            Some(ScanKind::Favourites) => {
+                if let Some(st) = self.set.stations.get(idx).cloned() {
+                    self.tune_station(&st);
+                }
+            }
+            Some(ScanKind::Window) => {
+                let (view_c, view_w) = self.view(span_hz);
+                let step = self.bandwidth_hz().max(100.0);
+                let n = self.scan_window_steps(span_hz);
+                // Kanály se kladou od levého kraje výřezu doprava, doprostřed
+                // každého kroku - ať naladěná značka nesedí na hraně.
+                let off = view_c - view_w / 2.0 + step * (idx as f64 + 0.5);
+                if n > 0 {
+                    self.set.offset_hz = off;
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Posune skener o krok dál a ohlídá, aby se zastavil na signálu.
+    /// Volá se každý snímek, dokud skener běží.
+    fn scan_tick(&mut self, span_hz: f64) {
+        let Some(scan) = self.scan.as_ref() else {
+            return;
+        };
+        // Bez zapnuté brány není podle čeho zastavovat - skener by jen
+        // bezcílně přelaďoval, tak radši skončí.
+        if !self.set.squelch_on {
+            self.scan = None;
+            return;
+        }
+        let now = std::time::Instant::now();
+        let kind = scan.kind;
+        let idx = scan.idx;
+        let holding = scan.holding;
+        let next_step = scan.next_step;
+        let quiet_since = scan.quiet_since;
+        let otevreno = self.signal_open();
+
+        if holding {
+            // Stojíme na stanici. Rozjedeme se, až bude chvíli ticho.
+            if otevreno {
+                if let Some(s) = self.scan.as_mut() {
+                    s.quiet_since = None;
+                }
+                return;
+            }
+            let od = match quiet_since {
+                Some(t) => t,
+                None => {
+                    if let Some(s) = self.scan.as_mut() {
+                        s.quiet_since = Some(now);
+                    }
+                    return;
+                }
+            };
+            if now.duration_since(od) < std::time::Duration::from_millis(SCAN_RESUME_MS) {
+                return;
+            }
+            if let Some(s) = self.scan.as_mut() {
+                s.holding = false;
+                s.quiet_since = None;
+                s.next_step = now;
+            }
+            return;
+        }
+
+        // Přelaďujeme. Když se na kanálu ozve signál, zastavíme.
+        if otevreno {
+            if let Some(s) = self.scan.as_mut() {
+                s.holding = true;
+                s.quiet_since = None;
+            }
+            return;
+        }
+        if now < next_step {
+            return;
+        }
+        let pocet = match kind {
+            ScanKind::Favourites => self.set.stations.len(),
+            ScanKind::Window => self.scan_window_steps(span_hz),
+        };
+        if pocet == 0 {
+            self.scan = None;
+            return;
+        }
+        let dalsi = (idx + 1) % pocet;
+        self.scan_goto(dalsi, span_hz);
+        if let Some(s) = self.scan.as_mut() {
+            s.idx = dalsi;
+            s.next_step = now + std::time::Duration::from_millis(SCAN_DWELL_MS);
+        }
+    }
+
+    /// Ovládání skeneru.
+    fn scan_controls(&mut self, ui: &mut egui::Ui, span_hz: f64) {
+        let bezi = self.scan.is_some();
+        // Skener pozná stanici jedině podle brány - bez ní nemá kde zastavit.
+        let lze = self.set.squelch_on;
+        ui.add_enabled_ui(lze || bezi, |ui| {
+            if bezi {
+                let drzi = self.scan.as_ref().is_some_and(|s| s.holding);
+                if ui
+                    .button("⏹ stop")
+                    .on_hover_text("ukončit skenování")
+                    .clicked()
+                {
+                    self.scan = None;
+                }
+                ui.label(
+                    egui::RichText::new(if drzi { "● stojí na signálu" } else { "⟳ hledám…" })
+                        .color(if drzi {
+                            egui::Color32::from_rgb(80, 200, 90)
+                        } else {
+                            egui::Color32::from_rgb(220, 200, 60)
+                        }),
+                );
+            } else {
+                ui.label("skenovat:");
+                for kind in [ScanKind::Favourites, ScanKind::Window] {
+                    // Skenovat prázdný seznam oblíbených nemá co dělat.
+                    let ok = kind != ScanKind::Favourites || !self.set.stations.is_empty();
+                    let resp = ui
+                        .add_enabled_ui(ok, |ui| ui.button(kind.label()))
+                        .inner;
+                    if resp.clicked() {
+                        self.scan = Some(Scan {
+                            kind,
+                            idx: 0,
+                            next_step: std::time::Instant::now(),
+                            holding: false,
+                            quiet_since: None,
+                        });
+                        self.scan_goto(0, span_hz);
+                    }
+                    if !ok {
+                        resp.on_hover_text("nejdřív si přidej nějakou oblíbenou stanici");
+                    }
+                }
+            }
+        })
+        .response
+        .on_hover_text(if lze || bezi {
+            "projíždí kanály a zastaví, když signál otevře šumovou bránu\n\
+             po ztichnutí stanice se za pár vteřin rozjede dál"
+        } else {
+            "skenování potřebuje zapnutou šumovou bránu - podle ní pozná stanici"
+        });
+    }
+
+    /// Nahrávání demodulovaného zvuku do WAV.
+    fn record_controls(&mut self, ui: &mut egui::Ui) {
+        let bezi = self.shared.recording.load(Ordering::Relaxed);
+        let popis = if bezi { "⏹ zastavit" } else { "⏺ nahrávat" };
+        if ui
+            .button(popis)
+            .on_hover_text(if bezi {
+                "dopsat hlavičku a soubor zavřít"
+            } else {
+                "uložit zvuk do WAV (48 kHz, 16 bit mono)\n\
+                 nahrává se před hlasitostí, takže knoflík nahrávku neovlivní"
+            })
+            .clicked()
+        {
+            if bezi {
+                self.shared.recording.store(false, Ordering::Relaxed);
+            } else {
+                // Jméno se skládá až tady, ať nese čas a frekvenci ze chvíle,
+                // kdy jsi zmáčkl nahrávat.
+                let path = record::default_dir()
+                    .join(record::file_name(self.tuned_khz(), self.set.mode.label()));
+                *self.shared.record_path.lock().unwrap() = path.to_string_lossy().to_string();
+                self.shared.recording.store(true, Ordering::Relaxed);
+            }
+        }
+        if bezi {
+            let s = self.shared.record_secs();
+            ui.label(
+                egui::RichText::new(format!("● {:.0}:{:02.0}", s / 60.0, s % 60.0))
+                    .color(egui::Color32::from_rgb(230, 90, 60))
+                    .strong(),
+            );
+        }
+        // Poslední hlášení (uloženo / chyba) - ať je vidět, kam to spadlo.
+        let stav = self.shared.record_status.lock().unwrap().clone();
+        if !stav.is_empty() {
+            ui.label(egui::RichText::new(stav).weak())
+                .on_hover_text(record::default_dir().to_string_lossy().to_string());
+        }
+    }
+
+    /// Ruční zádrž na heterodynní pískot.
+    fn notch_controls(&mut self, ui: &mut egui::Ui) {
+        // U FM nemá zádrž na audiu smysl - heterodyn se u frekvenční
+        // modulace neprojevuje jako stálý tón.
+        let ma_notch = !matches!(self.set.mode, dsp::Mode::Nfm | dsp::Mode::Wfm);
+        ui.add_enabled_ui(ma_notch, |ui| {
+            ui.checkbox(&mut self.set.notch_on, "notch");
+            ui.add_enabled_ui(self.set.notch_on, |ui| {
+                ui.add(
+                    egui::Slider::new(
+                        &mut self.set.notch_hz,
+                        dsp::NOTCH_MIN_HZ..=dsp::NOTCH_MAX_HZ,
+                    )
+                    .fixed_decimals(0)
+                    .suffix(" Hz"),
+                )
+                .on_hover_text("kmitočet zádrže - najeď na pískot, až zmizí");
+            });
+        })
+        .response
+        .on_hover_text(if ma_notch {
+            "úzká zádrž na heterodynní pískot od sousední nosné\n\
+             běží před AGC, takže po odstranění tónu zisk nezůstane stažený"
+        } else {
+            "u FM nemá zádrž na audiu smysl"
+        });
     }
 
     /// Konzole s textem z dekodéru.
@@ -607,12 +930,13 @@ impl App {
                         ui.separator();
                         ui.add(
                             egui::Slider::new(&mut self.set.cw_squelch_db, 3.0..=30.0)
-                                .text("squelch [dB]")
+                                .text("práh dekodéru [dB nad šumem]")
                                 .fixed_decimals(0),
                         )
                         .on_hover_text(
                             "o kolik musí signál vyčnívat nad šum, aby se dekódoval\n\
-                             níž = citlivější, ale víc nesmyslů ze šumu",
+                             níž = citlivější, ale víc nesmyslů ze šumu\n\
+                             (netýká se šumové brány zvuku - ta má práh v dBFS u S-metru)",
                         );
                         let wpm = self.shared.cw_wpm();
                         ui.label(egui::RichText::new(format!("~{wpm:.0} WPM")).weak())
@@ -843,6 +1167,38 @@ impl App {
             egui::Color32::WHITE,
         );
         resp.on_hover_text("úroveň naladěného signálu před AGC");
+    }
+
+    /// Volba rychlosti AGC. Rychlá se hodí na CW, pomalá na SSB a AM;
+    /// vypnutá dá ruční zisk pro případy, kdy AGC jen vytahuje šum v mezerách.
+    fn agc_controls(&mut self, ui: &mut egui::Ui) {
+        // WFM nemá v řetězci AGC (obálka je konstantní), tak ať to neslibuje
+        // něco, co nic nedělá.
+        let ma_agc = !self.set.mode.is_wfm();
+        ui.add_enabled_ui(ma_agc, |ui| {
+            ui.label("AGC:");
+            for m in dsp::AgcMode::ALL {
+                ui.selectable_value(&mut self.set.agc, m, m.label());
+            }
+            if self.set.agc == dsp::AgcMode::Off {
+                ui.add(
+                    egui::Slider::new(
+                        &mut self.set.agc_manual_db,
+                        radio::AGC_MANUAL_MIN_DB..=radio::AGC_MANUAL_MAX_DB,
+                    )
+                    .fixed_decimals(0)
+                    .suffix(" dB"),
+                )
+                .on_hover_text("ruční zisk - AGC je vypnutá");
+            }
+        })
+        .response
+        .on_hover_text(if ma_agc {
+            "jak rychle AGC pouští zisk zpátky nahoru\n\
+             rychlá = CW, pomalá = SSB a AM (nepumpuje šum mezi slovy)"
+        } else {
+            "WFM nemá AGC - u FM nese hlasitost zdvih, ne síla signálu"
+        });
     }
 
     /// Levý panel s oblíbenými stanicemi - jedno kliknutí = naladěno.
@@ -1326,9 +1682,21 @@ impl App {
     }
 }
 
-/// Úroveň v dB, nad kterou signál otevře CW squelch - k zakreslení do spektra.
+/// Ořízne text na danou délku a přidá výpustku. Řez padne na hranici znaku,
+/// jinak by to na diakritice panikařilo.
+fn zkrat(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let konec: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", konec.trim_end())
+}
+
+/// Úroveň v dB, nad kterou signál otevře práh CW dekodéru - k zakreslení do
+/// spektra. Netýká se šumové brány zvuku ([`dsp::Squelch`]), ta má práh rovnou
+/// v dBFS a kreslí se bez přepočtu.
 ///
-/// Není to prosté „šum + squelch". Dekodér počítá odstup v šířce svého
+/// Není to prosté „šum + práh". Dekodér počítá odstup v šířce svého
 /// kanálového filtru, kdežto spektrum ukazuje úroveň na jeden bin FFT.
 /// Šumu je v širším filtru víc, takže je potřeba přepočet `10*log10(bw/bin)`;
 /// bez něj by čára ležela u 500Hz filtru asi o 10 dB níž, než odpovídá
@@ -1518,11 +1886,18 @@ impl eframe::App for App {
             self.snap_to_strongest(&bins, span_hz);
         }
 
+        // Skener přelaďuje sám; musí dostat slovo dřív, než se vykreslí panel,
+        // ať je hned vidět, kde stojí.
+        self.scan_tick(span_hz);
+
         let tuned_khz = self.set.vfo_khz + self.set.offset_hz / 1000.0;
 
         egui::Panel::top("ovladani").show(ui, |ui| {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            // Zalamovací: do téhle řádky se vešlo ladění, režimy, S-metr,
+            // squelch i název stanice z RDS. Bez zalamování se to při užším
+            // okně uřízne vpravo a co nepasuje, není vidět vůbec.
+            ui.horizontal_wrapped(|ui| {
                 ui.label("VFO [kHz]:");
                 let resp =
                     ui.add(egui::TextEdit::singleline(&mut self.vfo_input).desired_width(90.0));
@@ -1573,6 +1948,72 @@ impl eframe::App for App {
                         .size(18.0)
                         .strong(),
                 );
+                // Název stanice z RDS patří rovnou k naladěné frekvenci - je
+                // to totéž, co u AM ukazuje rozpis EiBi, jen přímo z éteru.
+                //
+                // Ukazuje se i když se ještě nic nepřečetlo: jinak by nebylo
+                // poznat, jestli stanice RDS nevysílá, nebo je jen slabá -
+                // a hlavně by uživatel nevěděl, kam se vůbec dívat.
+                if self.set.mode.is_wfm() {
+                    let rds = self.shared.rds.lock().unwrap().clone();
+                    let stereo = self.shared.stereo_active.load(Ordering::Relaxed);
+                    // Pozor: pilot ≠ stereo. Stereo se dá vypnout přepínačem,
+                    // ale RDS na pilotu stojí pořád - proto se ptáme na pilot.
+                    let pilot = self.shared.pilot_locked.load(Ordering::Relaxed);
+                    let pilot_lvl = f32::from_bits(
+                        self.shared.pilot_level.load(Ordering::Relaxed),
+                    );
+                    if !rds.ps.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&rds.ps)
+                                .size(18.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(120, 200, 255)),
+                        )
+                        .on_hover_text(match rds.pi {
+                            Some(pi) => format!("název stanice z RDS (PI {pi:04X})"),
+                            None => "název stanice z RDS".to_string(),
+                        });
+                    } else {
+                        // Pilot je předpoklad RDS - když není, nemá cenu čekat.
+                        // Součástí hlášky je naměřená úroveň pilotu: bez ní by
+                        // nebylo poznat, jestli pilot chybí, nebo jen těsně
+                        // nedosáhl na práh.
+                        let (text, tip) = if pilot {
+                            // Počty bloků rovnou v hlášce: bez nich by nešlo
+                            // poznat, jestli demodulace nefunguje vůbec, nebo
+                            // jen občas propadne slabý signál.
+                            let ok = self.shared.rds_good.load(Ordering::Relaxed);
+                            let bad = self.shared.rds_bad.load(Ordering::Relaxed);
+                            (
+                                format!("RDS: hledám… ({ok}/{})", ok + bad),
+                                format!(
+                                    "pilot je chycený, čekám na datové bloky\n\
+                                     bloků prošlo {ok}, neprošlo {bad}\n\
+                                     když neprojde nic, je chyba v demodulaci nebo taktu"
+                                ),
+                            )
+                        } else {
+                            (
+                                format!("RDS: bez pilotu ({pilot_lvl:.3})"),
+                                format!(
+                                    "pilot 19 kHz nedosáhl na práh {:.3} - naměřeno {pilot_lvl:.4}\n\
+                                     bez pilotu se nedá odvodit nosná 57 kHz, na které RDS jede",
+                                    dsp::FM_PILOT_LOCK
+                                ),
+                            )
+                        };
+                        ui.label(egui::RichText::new(text).weak()).on_hover_text(tip);
+                    }
+                    if stereo {
+                        ui.label(
+                            egui::RichText::new("◉ stereo")
+                                .color(egui::Color32::from_rgb(80, 200, 90))
+                                .strong(),
+                        )
+                        .on_hover_text("pilot 19 kHz je slyšet, hraje se dvoukanálově");
+                    }
+                }
                 // V jakém úseku pásma zrovna jsme.
                 if let Some(s) = bandplan::at(tuned_khz) {
                     let (r, g, b) = s.usage.color();
@@ -1717,19 +2158,24 @@ impl eframe::App for App {
                     self.show_options = !self.show_options;
                 }
                 ui.separator();
-                // WFM má kanál pevný, posuvník šířky by nedělal nic.
-                if !self.set.mode.is_wfm() {
+                {
                     let (bw_min, bw_max) = radio::bandwidth_range(self.set.mode);
                     let mut bw_khz = self.bandwidth_hz() / 1000.0;
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut bw_khz, bw_min / 1000.0..=bw_max / 1000.0)
-                                .text("šířka [kHz]")
-                                .fixed_decimals(1),
-                        )
-                        .changed()
-                    {
+                    // U WFM jsou to stovky kHz, tam desetiny nedávají smysl.
+                    let wfm = self.set.mode.is_wfm();
+                    let resp = ui.add(
+                        egui::Slider::new(&mut bw_khz, bw_min / 1000.0..=bw_max / 1000.0)
+                            .text("šířka [kHz]")
+                            .fixed_decimals(if wfm { 0 } else { 1 }),
+                    );
+                    if resp.changed() {
                         self.set_bandwidth_hz(bw_khz * 1000.0);
+                    }
+                    if wfm {
+                        resp.on_hover_text(
+                            "šířka mezifrekvenční propusti\n\
+                             úžeji = odolnější proti sousední stanici, ale zkreslenější zvuk",
+                        );
                     }
                     ui.separator();
                 }
@@ -1754,6 +2200,29 @@ impl eframe::App for App {
                 ui.add(egui::Slider::new(&mut self.set.db_max, -60.0..=0.0).text("max"));
             });
             ui.add_space(2.0);
+            // Zvuk a skenování zvlášť, a navíc sbalitelně - ovládání je toho
+            // hodně a při běžném poslechu se do většiny z něj nesahá.
+            let audio_row = egui::CollapsingHeader::new("zvuk a skenování")
+                .default_open(self.set.show_audio_row)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        self.agc_controls(ui);
+                        ui.separator();
+                        self.notch_controls(ui);
+                        ui.separator();
+                        self.record_controls(ui);
+                        ui.separator();
+                        self.scan_controls(ui, span_hz);
+                        // Stereo jen ve WFM - jinde by přepínač nic nedělal.
+                        if self.set.mode.is_wfm() {
+                            ui.separator();
+                            self.wfm_controls(ui);
+                        }
+                    });
+                });
+            // Jestli je sekce rozbalená, si pamatujeme do příště.
+            self.set.show_audio_row = audio_row.openness > 0.5;
+            ui.add_space(2.0);
             self.band_buttons(ui, tuned_khz);
             ui.add_space(4.0);
         });
@@ -1761,10 +2230,21 @@ impl eframe::App for App {
         egui::Panel::bottom("stav").show(ui, |ui| {
             let status = self.shared.status.lock().unwrap().clone();
             let hw = self.shared.hw_status.lock().unwrap().clone();
-            ui.horizontal(|ui| {
+            // Taky zalamovací - RadioText bývá dlouhý a jinak by se uřízl.
+            ui.horizontal_wrapped(|ui| {
                 ui.label(status);
                 ui.separator();
                 ui.label(hw);
+                // RadioText bývá dlouhý a průběžně se mění - do horního panelu
+                // by nešel, tady má místo a nikomu nepřekáží.
+                if self.set.mode.is_wfm() {
+                    let rt = self.shared.rds.lock().unwrap().rt.clone();
+                    if !rt.is_empty() {
+                        ui.separator();
+                        ui.label(egui::RichText::new(format!("RDS: {}", zkrat(&rt, 70))).weak())
+                            .on_hover_text(&rt);
+                    }
+                }
             });
         });
 
@@ -1882,8 +2362,9 @@ impl eframe::App for App {
                 egui::Color32::from_rgba_unmultiplied(90, 160, 255, 40),
             );
 
-            // Squelch CW: nad touhle čárou signál dekodér otevře.
-            // Jen když squelch opravdu něco dělá.
+            // Práh CW dekodéru: nad touhle čárou signál dekodér otevře. Je to
+            // něco jiného než šumová brána zvuku níž - ta se kreslí zvlášť a
+            // má práh v absolutních dBFS, kdežto tahle čára stojí nad šumem.
             if self.active_decoder() == decode::Decoder::Cw {
                 if let Some(thr) = squelch_line_db(
                     &bins,
@@ -1904,7 +2385,7 @@ impl eframe::App for App {
                     painter.text(
                         egui::pos2(bw_rect.right() - 2.0, y - 1.0),
                         egui::Align2::RIGHT_BOTTOM,
-                        "squelch",
+                        "dekodér",
                         egui::FontId::proportional(9.0),
                         egui::Color32::from_rgb(255, 210, 60),
                     );
@@ -1930,6 +2411,28 @@ impl eframe::App for App {
                     egui::FontId::proportional(9.0),
                     egui::Color32::from_rgb(255, 130, 40),
                 );
+            }
+
+            // Notch: svislá značka tam, kde leží umlčený tón. Notch pracuje na
+            // audiu, tohle je jeho obraz ve spektru - vidíš, kterou nosnou bereš.
+            if self.set.notch_on {
+                for off in self.notch_rf_offsets() {
+                    let x = x_of(&rect, off);
+                    if x < rect.left() || x > rect.right() {
+                        continue;
+                    }
+                    painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(230, 90, 200)),
+                    );
+                    painter.text(
+                        egui::pos2(x + 3.0, rect.top() + 2.0),
+                        egui::Align2::LEFT_TOP,
+                        "notch",
+                        egui::FontId::proportional(9.0),
+                        egui::Color32::from_rgb(230, 90, 200),
+                    );
+                }
             }
 
             // Kreslíme jen biny uvnitř výřezu - jinak by se při zoomu počítaly

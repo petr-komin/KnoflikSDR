@@ -13,6 +13,7 @@
 //! stranu spektra a reálná složka výsledku je rovnou zvuk.
 
 use crate::decode::{CwDecoder, Decoder, RttyConfig, RttyDecoder};
+use crate::rds::{RdsDecoder, RdsInfo};
 use num_complex::Complex32;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
@@ -217,6 +218,52 @@ impl FirDecim {
     }
 }
 
+/// FIR s decimací pro **reálný** signál.
+///
+/// Za diskriminátorem je zvuk reálný, ale [`FirDecim`] by ho hnal přes
+/// komplexní násobení - tedy čtyřikrát víc práce, než je potřeba, a to na
+/// nejdražším místě řetězce. U WFM jsou takové filtry dva (součtový
+/// a rozdílový kanál), takže se to sečte.
+pub struct FirDecimReal {
+    taps: Vec<f32>,
+    hist: Vec<f32>,
+    mask: usize,
+    idx: usize,
+    decim: usize,
+    phase: usize,
+}
+
+impl FirDecimReal {
+    pub fn new(taps: Vec<f32>, decim: usize) -> Self {
+        let size = taps.len().next_power_of_two();
+        FirDecimReal {
+            taps,
+            hist: vec![0.0; size],
+            mask: size - 1,
+            idx: 0,
+            decim,
+            phase: 0,
+        }
+    }
+
+    #[inline]
+    pub fn push(&mut self, x: f32) -> Option<f32> {
+        self.hist[self.idx] = x;
+        self.idx = (self.idx + 1) & self.mask;
+        self.phase += 1;
+        if self.phase < self.decim {
+            return None;
+        }
+        self.phase = 0;
+        let mut acc = 0.0;
+        for (k, &t) in self.taps.iter().enumerate() {
+            let i = self.idx.wrapping_sub(1 + k) & self.mask;
+            acc += self.hist[i] * t;
+        }
+        Some(acc)
+    }
+}
+
 /// Odstranění stejnosměrné složky: y[n] = x[n] - x[n-1] + r*y[n-1].
 /// U AM tím zmizí nosná a zůstane modulace.
 pub struct DcBlock {
@@ -243,13 +290,60 @@ impl DcBlock {
     }
 }
 
-/// Jednoduchá AGC s rychlým náběhem a pomalým uvolněním.
+/// Jak rychle AGC pouští zisk zpátky nahoru. Náběh je vždycky rychlý (5 ms),
+/// ať silný signál nepráskne do sluchátek; liší se jen uvolnění.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AgcMode {
+    /// ~100 ms - na CW a pileup, kde má být slyšet každý znak zvlášť.
+    Fast,
+    /// ~500 ms - všeobecný kompromis.
+    #[default]
+    Medium,
+    /// ~2 s - na SSB a AM, kde rychlé uvolnění pumpuje šum mezi slovy.
+    Slow,
+    /// AGC vypnutá, zisk se řídí ručně. Na silné stanice, kde AGC jen
+    /// vytahuje šum v mezerách.
+    Off,
+}
+
+impl AgcMode {
+    pub const ALL: [AgcMode; 4] = [AgcMode::Fast, AgcMode::Medium, AgcMode::Slow, AgcMode::Off];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            AgcMode::Fast => "rychlá",
+            AgcMode::Medium => "střední",
+            AgcMode::Slow => "pomalá",
+            AgcMode::Off => "vypnutá",
+        }
+    }
+
+    /// Časová konstanta uvolnění v sekundách. U vypnuté AGC nemá smysl,
+    /// vrací se hodnota jen proto, aby šel koeficient spočítat jednotně.
+    fn decay_s(&self) -> f32 {
+        match self {
+            AgcMode::Fast => 0.100,
+            AgcMode::Medium => 0.500,
+            AgcMode::Slow => 2.000,
+            AgcMode::Off => 0.500,
+        }
+    }
+}
+
+/// Jednoduchá AGC s rychlým náběhem a nastavitelným uvolněním.
+///
+/// Obálku (`env`) sleduje **i když je AGC vypnutá** - visí na ní S-metr
+/// i šumová brána, takže kdyby se přestala počítat, přestaly by obě fungovat.
 pub struct Agc {
     env: f32,
     target: f32,
     attack: f32,
     decay: f32,
     max_gain: f32,
+    mode: AgcMode,
+    /// Ruční zisk pro `AgcMode::Off` (lineární činitel).
+    manual_gain: f32,
+    sample_rate: f32,
 }
 
 impl Agc {
@@ -257,11 +351,23 @@ impl Agc {
         Agc {
             env: 0.0,
             target: 0.25,
-            // ~5 ms náběh, ~500 ms uvolnění
+            // ~5 ms náběh
             attack: 1.0 - (-1.0 / (0.005 * sample_rate)).exp(),
-            decay: 1.0 - (-1.0 / (0.500 * sample_rate)).exp(),
+            decay: 1.0 - (-1.0 / (AgcMode::default().decay_s() * sample_rate)).exp(),
             max_gain: 500.0,
+            mode: AgcMode::default(),
+            manual_gain: 1.0,
+            sample_rate,
         }
+    }
+
+    /// Přepne režim AGC a nastaví ruční zisk v dB (uplatní se jen u `Off`).
+    pub fn set_mode(&mut self, mode: AgcMode, manual_gain_db: f32) {
+        if mode != self.mode {
+            self.mode = mode;
+            self.decay = 1.0 - (-1.0 / (mode.decay_s() * self.sample_rate)).exp();
+        }
+        self.manual_gain = 10f32.powf(manual_gain_db / 20.0);
     }
 
     /// Obálka signálu před regulací - přesně to, co má ukazovat S-metr.
@@ -274,12 +380,157 @@ impl Agc {
         let a = x.abs();
         let coef = if a > self.env { self.attack } else { self.decay };
         self.env += (a - self.env) * coef;
+        // Obálka se počítá vždycky (drží ji S-metr i squelch), regulace ne.
+        if self.mode == AgcMode::Off {
+            return (x * self.manual_gain).clamp(-1.0, 1.0);
+        }
         let g = if self.env > 1e-9 {
             (self.target / self.env).min(self.max_gain)
         } else {
             1.0
         };
         (x * g).clamp(-1.0, 1.0)
+    }
+}
+
+/// Biquad podle RBJ Cookbook. Používá se na vytažení pilotu 19 kHz
+/// a na RDS podnosnou; koeficienty jsou už poděleny a0.
+#[derive(Clone, Copy)]
+pub struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+impl Biquad {
+    /// Pásmová propust s jednotkovým ziskem ve špičce.
+    pub fn bandpass(f0: f64, q: f64, fs: f64) -> Self {
+        let w0 = 2.0 * PI * f0 / fs;
+        let alpha = w0.sin() / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        Biquad {
+            b0: (alpha / a0) as f32,
+            b1: 0.0,
+            b2: (-alpha / a0) as f32,
+            a1: (-2.0 * w0.cos() / a0) as f32,
+            a2: ((1.0 - alpha) / a0) as f32,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    /// Dolní propust.
+    pub fn lowpass(f0: f64, q: f64, fs: f64) -> Self {
+        let w0 = 2.0 * PI * f0 / fs;
+        let alpha = w0.sin() / (2.0 * q);
+        let cos_w0 = w0.cos();
+        let a0 = 1.0 + alpha;
+        Biquad {
+            b0: (((1.0 - cos_w0) / 2.0) / a0) as f32,
+            b1: ((1.0 - cos_w0) / a0) as f32,
+            b2: (((1.0 - cos_w0) / 2.0) / a0) as f32,
+            a1: (-2.0 * cos_w0 / a0) as f32,
+            a2: ((1.0 - alpha) / a0) as f32,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    #[inline]
+    pub fn push(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2 - self.a1 * self.y1
+            - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+}
+
+/// Meze ručního notche v Hz (audio pásmo, kde heterodyn píská).
+pub const NOTCH_MIN_HZ: f64 = 100.0;
+pub const NOTCH_MAX_HZ: f64 = 5_000.0;
+/// Jakost notche. Vysoká = úzký zásek, který sebere pískot a hlas nechá být;
+/// při 30 je zádrž na 1 kHz široká zhruba 33 Hz.
+const NOTCH_Q: f64 = 30.0;
+
+/// Úzká pásmová zádrž (biquad podle RBJ Cookbook) na audiu.
+///
+/// Na KV je nejotravnější vada heterodynní pískot od nosné sousední stanice.
+/// Zádrž běží **před AGC** schválně: kdyby byla až za ní, silný pískot by
+/// mezitím stáhl zisk a užitečný signál by zůstal potichu i po odstranění tónu.
+pub struct Notch {
+    /// Koeficienty normalizované na a0; `None` = vypnuto.
+    coefs: Option<[f32; 5]>,
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+    sample_rate: f64,
+    freq_hz: f64,
+}
+
+impl Notch {
+    pub fn new(sample_rate: f64) -> Self {
+        Notch {
+            coefs: None,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+            sample_rate,
+            freq_hz: 0.0,
+        }
+    }
+
+    /// Nastaví kmitočet zádrže v Hz, nebo `None` pro vypnutí.
+    pub fn set_freq(&mut self, hz: Option<f64>) {
+        match hz {
+            Some(f) => {
+                // Přepočítávat koeficienty na každém vzorku nemá smysl; jen
+                // když se kmitočet opravdu hnul.
+                if self.coefs.is_some() && (f - self.freq_hz).abs() < 0.5 {
+                    return;
+                }
+                self.freq_hz = f;
+                let w0 = 2.0 * PI * f / self.sample_rate;
+                let alpha = w0.sin() / (2.0 * NOTCH_Q);
+                let (cos_w0, a0) = (w0.cos(), 1.0 + alpha);
+                // b0, b1, b2, a1, a2 - už poděleno a0.
+                self.coefs = Some([
+                    (1.0 / a0) as f32,
+                    (-2.0 * cos_w0 / a0) as f32,
+                    (1.0 / a0) as f32,
+                    (-2.0 * cos_w0 / a0) as f32,
+                    ((1.0 - alpha) / a0) as f32,
+                ]);
+            }
+            None => self.coefs = None,
+        }
+    }
+
+    #[inline]
+    pub fn push(&mut self, x: f32) -> f32 {
+        let Some([b0, b1, b2, a1, a2]) = self.coefs else {
+            return x;
+        };
+        let y = b0 * x + b1 * self.x1 + b2 * self.x2 - a1 * self.y1 - a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
     }
 }
 
@@ -337,10 +588,12 @@ impl Squelch {
         }
     }
 
-    /// Aktualizuje bránu podle aktuální síly signálu (lineární obálka před AGC)
-    /// a vrátí vzorek přiškrcený aktuálním ziskem brány.
+    /// Posune bránu o jeden vzorek podle síly signálu a vrátí zisk 0..1.
+    ///
+    /// Odděleno od [`Squelch::gate`] kvůli stereu: oba kanály musí dostat
+    /// **týž** zisk, jinak by se při otevírání a zavírání rozjel stereo obraz.
     #[inline]
-    pub fn gate(&mut self, level_lin: f32, x: f32) -> f32 {
+    pub fn gain_for(&mut self, level_lin: f32) -> f32 {
         if let Some(open_lin) = self.open_lin {
             if self.open {
                 if level_lin < self.close_lin {
@@ -356,7 +609,14 @@ impl Squelch {
         } else if self.gain > target {
             self.gain = (self.gain - self.ramp).max(target);
         }
-        x * self.gain
+        self.gain
+    }
+
+    /// Aktualizuje bránu podle aktuální síly signálu (lineární obálka před AGC)
+    /// a vrátí vzorek přiškrcený aktuálním ziskem brány.
+    #[inline]
+    pub fn gate(&mut self, level_lin: f32, x: f32) -> f32 {
+        x * self.gain_for(level_lin)
     }
 }
 
@@ -368,6 +628,83 @@ const FM_DEVIATION_HZ: f64 = 75_000.0;
 const FM_DEEMPHASIS_S: f64 = 50e-6;
 /// Nejvyšší modulační kmitočet FM rozhlasu - meze audio propusti.
 const FM_AUDIO_HZ: f64 = 15_000.0;
+
+/// Stereo pilot. Vysílač ho posílá na 19 kHz a podnosná s rozdílovým signálem
+/// je přesně na jeho dvojnásobku a ve fázi s ním - proto se 38 kHz nemusí
+/// hledat, stačí pilot vynásobit sám sebou.
+const FM_PILOT_HZ: f64 = 19_000.0;
+/// Jakost propusti na pilot. Úzko, ať do ní neleze okolní modulace.
+const FM_PILOT_Q: f64 = 60.0;
+/// Jak silný musí být pilot, aby se pustilo stereo. Vysílá se s ~9 % zdvihu,
+/// tedy amplitudou kolem 0,09 po normalizaci diskriminátoru na ±1; pod 0,02
+/// už jde spíš o šum a stereo by jen syčelo.
+pub const FM_PILOT_LOCK: f32 = 0.02;
+/// Kolikanásobek prahu drží už chycený pilot. Hystereze - jinak by stanice
+/// na hraně překlápěla stereo sem a tam a lupalo by to.
+const FM_PILOT_UNLOCK: f32 = 0.6;
+/// Šířka smyčky fázového závěsu na pilot v Hz. Úzko: pilot je kmitočtově
+/// stabilní, tak ať smyčku nerozhoupe šum a nosná zůstane čistá.
+const FM_PLL_BW_HZ: f64 = 20.0;
+
+/// Fázový závěs na stereo pilot.
+///
+/// Nosná 38 kHz i 57 kHz se dá vyrobit umocňováním pilotu (cos2θ = 2cos²θ−1),
+/// jenže vstupní pilot je zašuměný a umocňování ten šum ještě znásobí -
+/// do nosné se tím dostane fázový šum a RDS pak chybuje. Závěs místo toho
+/// **nahradí** pilot vlastním čistým oscilátorem, který se na něj naladí;
+/// násobky úhlu z něj pak vyjdou přesně.
+struct PilotPll {
+    /// Fáze a kmitočet oscilátoru v radiánech na vzorek.
+    phase: f32,
+    freq: f32,
+    /// Klidový kmitočet, od kterého se smyčka nesmí utrhnout.
+    nominal: f32,
+    kp: f32,
+    ki: f32,
+    /// Koherentně měřená amplituda pilotu - průmět vstupu do fáze oscilátoru.
+    /// Poctivější míra než obálka za propustí, protože šum mimo fázi se vyruší.
+    amp: f32,
+}
+
+impl PilotPll {
+    fn new(sample_rate: f64) -> Self {
+        let nominal = 2.0 * PI * FM_PILOT_HZ / sample_rate;
+        // Standardní návrh smyčky 2. řádu s tlumením 0,707.
+        let wn = 2.0 * PI * FM_PLL_BW_HZ / sample_rate;
+        PilotPll {
+            phase: 0.0,
+            freq: nominal as f32,
+            nominal: nominal as f32,
+            kp: (2.0 * 0.707 * wn) as f32,
+            ki: (wn * wn) as f32,
+            amp: 0.0,
+        }
+    }
+
+    /// Posune oscilátor o vzorek podle vstupního pilotu a vrátí (cosθ, sinθ).
+    #[inline]
+    fn next(&mut self, pilot: f32) -> (f32, f32) {
+        let (s, c) = self.phase.sin_cos();
+        // Koherentní amplituda: průmět vstupu do fáze oscilátoru.
+        self.amp += (pilot * c * 2.0 - self.amp) * 0.0005;
+        // Fázový detektor. Dělením amplitudou je zisk smyčky nezávislý na
+        // síle signálu, takže se chová stejně na slabé i silné stanici.
+        let err = -pilot * s / self.amp.abs().max(1e-4);
+        self.freq += self.ki * err;
+        // Kmitočet držíme u klidové hodnoty, ať se smyčka nechytí na něčem jiném.
+        let max_odchylka = self.nominal * 0.02;
+        self.freq = self
+            .freq
+            .clamp(self.nominal - max_odchylka, self.nominal + max_odchylka);
+        self.phase += self.freq + self.kp * err;
+        if self.phase > PI as f32 {
+            self.phase -= 2.0 * PI as f32;
+        } else if self.phase < -(PI as f32) {
+            self.phase += 2.0 * PI as f32;
+        }
+        (c, s)
+    }
+}
 
 /// Typický zdvih amatérské úzkopásmové FM - normuje diskriminátor na ±1.
 const NFM_DEVIATION_HZ: f64 = 5_000.0;
@@ -405,20 +742,46 @@ fn wfm_if_decim(in_rate: f64, total_decim: usize) -> usize {
 struct WfmDemod {
     /// Antialias + decimace na mezifrekvenci (široká, drží celý FM kanál).
     if_lp: FirDecim,
-    if_rate: f64,
     /// Předchozí vzorek pro frekvenční diskriminátor.
     last: Complex32,
     /// Normalizace úhlu na ±1 při plném zdvihu.
     disc_gain: f32,
-    /// Stav a koeficient deemfáze (jednopólová dolní propust).
-    deemph_y: f32,
+    /// Propust na stereo pilot 19 kHz a sledovač jeho amplitudy.
+    pilot_bp: Biquad,
+    pilot_env: f32,
+    /// Fázový závěs na pilot. Z jeho fáze se vyrábí podnosná 38 kHz i nosná
+    /// RDS 57 kHz - čistě, bez šumu, který by přineslo umocňování pilotu.
+    pll: PilotPll,
+    /// Přeje si uživatel stereo? Bez pilotu se stejně jede mono.
+    stereo_wanted: bool,
+    /// Je pilot dost silný na to, aby stereo dávalo smysl?
+    pilot_locked: bool,
+    /// Plynulé prolnutí mono (0) - stereo (1) a jeho krok na jeden audio vzorek.
+    stereo_blend: f32,
+    blend_step: f32,
+    /// Součtová (L+R) a rozdílová (L-R) cesta: propust do 15 kHz + decimace
+    /// na 48 kHz. Obě mají stejné koeficienty i decimaci, takže výstupy
+    /// vypadávají zároveň a kanály se nerozejdou.
+    sum_lp: FirDecimReal,
+    diff_lp: FirDecimReal,
+    /// Deemfáze až za oddělením kanálů - kdyby běžela na celém multiplexu,
+    /// srazila by 38 kHz podnosnou a stereo by nebylo z čeho složit.
+    deemph_l: f32,
+    deemph_r: f32,
     deemph_a: f32,
-    /// Audio propust + decimace z mezifrekvence na 48 kHz.
-    audio_lp: FirDecim,
     /// Odstranění DC z rozladění (funguje jako jemné AFC do sluchátek).
-    dc: DcBlock,
+    dc_l: DcBlock,
+    dc_r: DcBlock,
     /// Obálka mezifrekvence pro S-metr (FM má konstantní amplitudu).
     level: f32,
+    /// Dekodér RDS. Bere multiplex na mezifrekvenci a nosnou 57 kHz
+    /// odvozenou z pilotu.
+    rds: RdsDecoder,
+    /// Vstupní vzorkovačka, decimace a šířka kanálu - drží se kvůli přepočtu
+    /// mezifrekvenční propusti, když se šířka změní za běhu.
+    in_rate: f64,
+    if_decim: usize,
+    bandwidth_hz: f64,
 }
 
 impl WfmDemod {
@@ -435,29 +798,44 @@ impl WfmDemod {
             .collect();
 
         // Audio propust: do 15 kHz, zahradí alias při decimaci na 48 kHz.
-        let audio_taps: Vec<Complex32> =
-            lowpass_taps(FM_AUDIO_HZ, if_rate, pre_taps(audio_decim))
-                .into_iter()
-                .map(|h| Complex32::new(h, 0.0))
-                .collect();
+        // Za diskriminátorem je signál reálný, tak i filtr jede reálně.
+        let audio_taps = lowpass_taps(FM_AUDIO_HZ, if_rate, pre_taps(audio_decim));
 
-        let deemph_a = 1.0 - (-1.0 / (FM_DEEMPHASIS_S * if_rate)).exp();
+        // Deemfáze teď běží až na 48 kHz, za decimací.
+        let audio_rate = if_rate / audio_decim as f64;
+        let deemph_a = 1.0 - (-1.0 / (FM_DEEMPHASIS_S * audio_rate)).exp();
         WfmDemod {
             if_lp: FirDecim::new(if_taps, if_decim),
-            if_rate,
             last: Complex32::new(0.0, 0.0),
             disc_gain: (if_rate / (2.0 * std::f64::consts::PI * FM_DEVIATION_HZ)) as f32,
-            deemph_y: 0.0,
+            pilot_bp: Biquad::bandpass(FM_PILOT_HZ, FM_PILOT_Q, if_rate),
+            pilot_env: 0.0,
+            pll: PilotPll::new(if_rate),
+            stereo_wanted: true,
+            pilot_locked: false,
+            stereo_blend: 0.0,
+            // ~30 ms přechod mezi mono a stereem.
+            blend_step: (1.0 / (0.030 * audio_rate)) as f32,
+            sum_lp: FirDecimReal::new(audio_taps.clone(), audio_decim),
+            diff_lp: FirDecimReal::new(audio_taps, audio_decim),
+            deemph_l: 0.0,
+            deemph_r: 0.0,
             deemph_a: deemph_a as f32,
-            audio_lp: FirDecim::new(audio_taps, audio_decim),
-            dc: DcBlock::new(0.995),
+            dc_l: DcBlock::new(0.995),
+            dc_r: DcBlock::new(0.995),
             level: 1e-9,
+            rds: RdsDecoder::new(if_rate),
+            in_rate,
+            if_decim,
+            bandwidth_hz: FM_CHANNEL_HZ,
         }
     }
 
     /// Vstup je už smíšený na offset NCO (stejně jako u ostatních režimů),
     /// takže sem chodí pásmo se stanicí kolem DC. `squelch` hradluje výstup
     /// stejně jako u ostatních režimů - u FM podle síly nosné na mezifrekvenci.
+    ///
+    /// Na výstup jdou prokládané dvojice L, R.
     fn process(&mut self, mixed: Complex32, out: &mut Vec<f32>, squelch: &mut Squelch) {
         let Some(z) = self.if_lp.push(mixed) else {
             return;
@@ -467,23 +845,110 @@ impl WfmDemod {
         self.level += (mag - self.level) * 0.001;
 
         // Frekvenční diskriminátor: úhel mezi po sobě jdoucími vzorky je
-        // úměrný okamžité frekvenci, tedy modulaci.
+        // úměrný okamžité frekvenci, tedy modulaci. Výsledek je multiplex:
+        // L+R v základním pásmu, pilot 19 kHz, L-R na 38 kHz, RDS na 57 kHz.
         let d = z * self.last.conj();
         self.last = z;
-        let angle = d.im.atan2(d.re);
-        let demod = angle * self.disc_gain;
+        let mpx = d.im.atan2(d.re) * self.disc_gain;
 
-        // Deemfáze zvedne basy zpět po vysílačově preemfázi.
-        self.deemph_y += self.deemph_a * (demod - self.deemph_y);
+        // Pilot: úzká propust a na ni navěšený fázový závěs. Podnosná 38 kHz
+        // je přesně dvojnásobek pilotu a ve fázi s ním, RDS pak trojnásobek -
+        // z fáze oscilátoru tedy vyjdou oba přesně a bez šumu.
+        let pilot = self.pilot_bp.push(mpx);
+        let (c1, s1) = self.pll.next(pilot);
+        let cos38 = 2.0 * c1 * c1 - 1.0;
+        let sin38 = 2.0 * s1 * c1;
+        // 57 kHz = 3θ, složeno z 2θ a θ: cos(a+b), sin(a+b).
+        let cos57 = c1 * cos38 - s1 * sin38;
+        let sin57 = s1 * cos38 + c1 * sin38;
 
-        if let Some(a) = self.audio_lp.push(Complex32::new(self.deemph_y, 0.0)) {
-            let s = self.dc.push(a.re);
-            out.push(squelch.gate(self.level, s));
+        // Sílu pilotu bere z koherentní amplitudy závěsu: ta měří jen to, co je
+        // s pilotem ve fázi, kdežto obálka za propustí počítá i šum kolem něj
+        // a na slabé stanici by lhala nahoru.
+        //
+        // Rozhodnutí o stereu má hysterezi - u stanice na hraně by se jinak
+        // překlápělo sem a tam a každé překlopení by luplo do sluchátek.
+        self.pilot_env = self.pll.amp.abs();
+        if self.pilot_locked {
+            if self.pilot_env < FM_PILOT_LOCK * FM_PILOT_UNLOCK {
+                self.pilot_locked = false;
+            }
+        } else if self.pilot_env > FM_PILOT_LOCK {
+            self.pilot_locked = true;
         }
+        let stereo = self.stereo_wanted && self.pilot_locked;
+
+        // RDS jede vždycky, když je pilot - na hlasitosti ani na stereu
+        // nezávisí a jeho text se hodí i u mono poslechu. Dostává obě fáze
+        // nosné: skutečná podnosná je proti té odvozené z pilotu natočená
+        // o neznámý úhel (skupinové zpoždění propustí, a norma navíc připouští
+        // kvadraturu), takže si dekodér fázi musí dohledat sám.
+        if self.pilot_locked {
+            self.rds.push(mpx, cos57, sin57);
+        }
+
+        // Rozdílová složka: multiplex vynásobený podnosnou. Součin má užitečný
+        // signál v základním pásmu a smetí kolem 76 kHz, které sundá propust.
+        let diff_in = if stereo { 2.0 * mpx * cos38 } else { 0.0 };
+        let sum_out = self.sum_lp.push(mpx);
+        let diff_out = self.diff_lp.push(diff_in);
+
+        let (Some(s), Some(dd)) = (sum_out, diff_out) else {
+            return;
+        };
+        // Přechod mezi mono a stereem se prolíná, ne přepíná. Skokem by se
+        // výstup posunul o celou rozdílovou složku naráz - a to je slyšet
+        // jako lupnutí pokaždé, když pilot přeskočí přes práh.
+        let cil = if stereo { 1.0 } else { 0.0 };
+        if self.stereo_blend < cil {
+            self.stereo_blend = (self.stereo_blend + self.blend_step).min(cil);
+        } else if self.stereo_blend > cil {
+            self.stereo_blend = (self.stereo_blend - self.blend_step).max(cil);
+        }
+        // L = (L+R) + (L−R), R = (L+R) − (L−R); při prolnutí se rozdílová
+        // složka přimíchává postupně.
+        let d_mix = dd * self.stereo_blend;
+        let (l_raw, r_raw) = (s + d_mix, s - d_mix);
+        // Deemfáze zvedne basy zpět po vysílačově preemfázi - každý kanál zvlášť.
+        self.deemph_l += self.deemph_a * (l_raw - self.deemph_l);
+        self.deemph_r += self.deemph_a * (r_raw - self.deemph_r);
+
+        let l = self.dc_l.push(self.deemph_l);
+        let r = self.dc_r.push(self.deemph_r);
+        // Oba kanály musí dostat týž zisk brány, jinak by se stereo obraz
+        // při otevírání a zavírání rozjel do strany.
+        let g = squelch.gain_for(self.level);
+        out.push(l * g);
+        out.push(r * g);
     }
 
     fn level_dbfs(&self) -> f32 {
         20.0 * self.level.max(1e-9).log10()
+    }
+
+    /// Hraje se zrovna doopravdy stereo? (Uživatel ho chce a pilot je slyšet.)
+    fn stereo_active(&self) -> bool {
+        self.stereo_wanted && self.pilot_locked
+    }
+
+    /// Změní šířku mezifrekvenční propusti za běhu.
+    ///
+    /// Užší filtr zvládne sousední stanici, která přebíjí tu naladěnou; širší
+    /// pustí plný zdvih bez zkreslení. Historie filtru zůstává, takže změna
+    /// za poslechu necvakne. Užší než ~120 kHz už ale ořezává i vlastní
+    /// signál - proto se pod to nedá jít, viz `bandwidth_range`.
+    fn set_bandwidth(&mut self, bw_hz: f64) {
+        if (bw_hz - self.bandwidth_hz).abs() < 1.0 {
+            return;
+        }
+        self.bandwidth_hz = bw_hz;
+        let if_rate = self.in_rate / self.if_decim as f64;
+        let cut = (bw_hz / 2.0).min(if_rate * 0.45);
+        let taps: Vec<Complex32> = lowpass_taps(cut, self.in_rate, pre_taps(self.if_decim))
+            .into_iter()
+            .map(|h| Complex32::new(h, 0.0))
+            .collect();
+        self.if_lp.set_taps(taps);
     }
 }
 
@@ -500,6 +965,8 @@ pub struct Demod {
     agc: Agc,
     /// Šumová brána na výstupu. Společná pro všechny režimy.
     squelch: Squelch,
+    /// Ruční zádrž na heterodyn, běží na audiu před AGC.
+    notch: Notch,
     /// Širokopásmová FM. Vlastní řetězec s vlastní decimací; drží se pořád,
     /// zapojí se jen v režimu WFM.
     wfm: WfmDemod,
@@ -558,6 +1025,7 @@ impl Demod {
             dc: DcBlock::new(0.995),
             agc: Agc::new(out_rate as f32),
             squelch: Squelch::new(out_rate as f32),
+            notch: Notch::new(out_rate),
             wfm: WfmDemod::new(in_rate, decim),
             nfm_last: Complex32::new(0.0, 0.0),
             nfm_lp: 0.0,
@@ -618,7 +1086,14 @@ impl Demod {
     }
 
     /// Změní šířku propustného pásma za běhu (přepočet koeficientů).
+    ///
+    /// WFM má vlastní řetězec, takže se šířka propisuje do jeho mezifrekvenční
+    /// propusti; ostatní režimy ji mají v kanálovém filtru.
     pub fn set_bandwidth(&mut self, bw_hz: f64) {
+        if self.mode.is_wfm() {
+            self.wfm.set_bandwidth(bw_hz);
+            return;
+        }
         if (bw_hz - self.bandwidth_hz).abs() > 1.0 {
             self.bandwidth_hz = bw_hz;
             self.refresh_taps();
@@ -636,6 +1111,59 @@ impl Demod {
     /// nebo `None` pro vypnutí squelche.
     pub fn set_squelch(&mut self, db: Option<f32>) {
         self.squelch.set_threshold(db);
+    }
+
+    /// Přepne režim AGC. WFM se to netýká - ten má konstantní obálku, takže
+    /// AGC v jeho řetězci není a hlasitost dělá zdvih, ne síla signálu.
+    pub fn set_agc(&mut self, mode: AgcMode, manual_gain_db: f32) {
+        self.agc.set_mode(mode, manual_gain_db);
+    }
+
+    /// Nastaví kmitočet ruční zádrže na audiu, nebo `None` pro vypnutí.
+    pub fn set_notch(&mut self, hz: Option<f64>) {
+        self.notch.set_freq(hz);
+    }
+
+    /// Přeje si uživatel stereo u WFM? Bez pilotu se stejně jede mono.
+    pub fn set_stereo(&mut self, on: bool) {
+        self.wfm.stereo_wanted = on;
+    }
+
+    /// Hraje se zrovna stereo? Jen ve WFM, a jen když je slyšet pilot.
+    pub fn stereo_active(&self) -> bool {
+        self.mode.is_wfm() && self.wfm.stereo_active()
+    }
+
+    /// Je chycený stereo pilot? Odděleně od [`Demod::stereo_active`] - ten
+    /// navíc závisí na tom, jestli uživatel stereo vůbec chce, kdežto RDS
+    /// jede z pilotu bez ohledu na to.
+    pub fn pilot_locked(&self) -> bool {
+        self.mode.is_wfm() && self.wfm.pilot_locked
+    }
+
+    /// Naměřená úroveň pilotu - přímo ta veličina, která se porovnává
+    /// s [`FM_PILOT_LOCK`], ať jde číslo v GUI číst proti prahu.
+    ///
+    /// Na poctivé stereo stanici má vyjít kolem 0,09: pilot se vysílá
+    /// s ~9 % zdvihu a závěs měří přímo jeho amplitudu.
+    pub fn pilot_level(&self) -> f32 {
+        self.wfm.pilot_env
+    }
+
+    /// Co zatím přečetl RDS. Prázdné, když stanice RDS nevysílá nebo je slabá.
+    pub fn rds(&self) -> &RdsInfo {
+        self.wfm.rds.info()
+    }
+
+    /// Kolik datových bloků RDS prošlo kontrolou a kolik ne.
+    pub fn rds_blocks(&self) -> (u32, u32) {
+        self.wfm.rds.block_stats()
+    }
+
+    /// Otevření oka RDS a kolikrát se chytala synchronizace - pro diagnostiku.
+    pub fn rds_quality(&self) -> (f32, u32, bool) {
+        let (n, drzi) = self.wfm.rds.sync_stats();
+        (self.wfm.rds.eye(), n, drzi)
     }
 
     /// Úroveň naladěného signálu v dBFS (před AGC). Pro S-metr.
@@ -710,7 +1238,9 @@ impl Demod {
                     // WFM odbočuje na začátku process(), sem se nedostane.
                     Mode::Wfm => unreachable!("WFM má vlastní řetězec"),
                 };
-                let audio = self.dc.push(detected);
+                // Zádrž na heterodyn ještě před AGC - jinak by pískot stáhl
+                // zisk a po jeho odstranění by zbyl podregulovaný signál.
+                let audio = self.notch.push(self.dc.push(detected));
                 let s = self.agc.push(audio);
                 // Squelch bere sílu z obálky před AGC - té samé, ze které se
                 // počítá S-metr. NFM má vlastní obálku (nosná je konstantní),
@@ -719,7 +1249,12 @@ impl Demod {
                     Mode::Nfm => self.nfm_level,
                     _ => self.agc.envelope(),
                 };
-                out.push(self.squelch.gate(level, s));
+                // Výstup je vždycky prokládané stereo; mono režimy dají do
+                // obou kanálů totéž. Díky tomu má zvuková cesta jediný tvar
+                // a při přepnutí na WFM stereo se nemůže rozejít L a R.
+                let g = self.squelch.gate(level, s);
+                out.push(g);
+                out.push(g);
             }
         }
     }
@@ -836,6 +1371,13 @@ mod wfm_tests {
     use super::*;
     use std::f64::consts::PI;
 
+    /// Vytáhne levý kanál z prokládaného stereo výstupu. Testy měří spektrum
+    /// zvuku, a to by se na prokládaném proudu počítalo na dvojnásobné
+    /// vzorkovačce - tón by pak vyšel na půlce binu, kde má být.
+    fn levy_kanal(out: &[f32]) -> Vec<f32> {
+        out.chunks_exact(2).map(|p| p[0]).collect()
+    }
+
     /// Rozdělení decimace pro WFM musí dát mezifrekvenci v použitelném pásmu
     /// (200-400 kHz) a obě dílčí decimace musí vyjít celočíselně na 48 kHz.
     #[test]
@@ -887,6 +1429,8 @@ mod wfm_tests {
             wfm.process(iq, &mut out, &mut sq);
         }
 
+        // Výstup je prokládané stereo, na spektrum se bere levý kanál.
+        let out = levy_kanal(&out);
         assert!(out.len() > 4096, "málo audio vzorků: {}", out.len());
         // Ve spektru výstupu musí dominovat 1 kHz.
         let m = 4096.min(out.len() & !1);
@@ -927,6 +1471,8 @@ mod wfm_tests {
         let mut out = Vec::new();
         d.process(&iq, &mut out);
 
+        // Prokládané stereo - NFM dává do obou kanálů totéž.
+        let out = levy_kanal(&out);
         assert!(out.len() > 8192, "málo audia: {}", out.len());
         let m = 8192;
         let mut buf: Vec<Complex32> =
@@ -941,12 +1487,264 @@ mod wfm_tests {
         );
     }
 
-    /// Bez signálu (jen šum na nule) nesmí demodulátor vyrábět silný tón.
+    /// Deemfáze běží až za decimací, na 48 kHz - kdyby zůstala na multiplexu
+    /// před oddělením kanálů, srazila by 38 kHz podnosnou a stereo by nebylo
+    /// z čeho složit. Koeficient tomu musí odpovídat.
     #[test]
-    fn deemfaze_koeficient_je_rozumny() {
-        // Pro 336 kHz IF a 50 µs má koeficient vyjít malý kladný (<0,1).
+    fn deemfaze_koeficient_odpovida_audio_rychlosti() {
         let wfm = WfmDemod::new(1_344_000.0, 28);
-        assert!(wfm.deemph_a > 0.0 && wfm.deemph_a < 0.2, "a = {}", wfm.deemph_a);
+        // Pro 48 kHz a 50 µs: 1 - exp(-1/(50e-6 * 48000)) = 0,342.
+        let cekano = 1.0 - (-1.0f32 / (FM_DEEMPHASIS_S as f32 * 48_000.0)).exp();
+        assert!(
+            (wfm.deemph_a - cekano).abs() < 1e-4,
+            "a = {}, čekáno {cekano}",
+            wfm.deemph_a
+        );
+    }
+
+    /// Kolik procesoru sežere WFM řetězec na plné vzorkovačce RSP1.
+    ///
+    /// Tohle je to podstatné číslo: když demodulace nestíhá realtime, DSP
+    /// vlákno odebírá z USB pomalu, libmirisdr začne hlásit "samples lost"
+    /// a v éteru je to slyšet jako lupání. Musí zbýt rezerva i na FFT
+    /// panoramatu a na zbytek systému.
+    #[test]
+    fn zmer_vykon_wfm() {
+        let in_rate = 1_344_000.0;
+        let decim = 28;
+        let secs = 5.0;
+        let n = (in_rate * secs) as usize;
+
+        // Plný multiplex včetně pilotu, ať se počítá i stereo a RDS.
+        let mut iq = Vec::with_capacity(n);
+        let mut ph = 0.0f64;
+        for i in 0..n {
+            let t = i as f64 / in_rate;
+            let l = (2.0 * PI * 1_000.0 * t).sin();
+            let pilot = (2.0 * PI * FM_PILOT_HZ * t).cos();
+            let sub = (2.0 * PI * 2.0 * FM_PILOT_HZ * t).cos();
+            let mpx = 0.45 * l + 0.45 * l * sub + 0.1 * pilot;
+            ph += 2.0 * PI * (FM_DEVIATION_HZ * mpx) / in_rate;
+            iq.push(Complex32::new(ph.cos() as f32, ph.sin() as f32));
+        }
+
+        let mut wfm = WfmDemod::new(in_rate, decim);
+        let mut sq = Squelch::new(48_000.0);
+        let mut out = Vec::with_capacity(n / decim * 2);
+
+        // Rozehřát cache.
+        for &x in iq.iter().take(n / 10) {
+            wfm.process(x, &mut out, &mut sq);
+        }
+        out.clear();
+
+        let t0 = std::time::Instant::now();
+        for &x in &iq {
+            wfm.process(x, &mut out, &mut sq);
+        }
+        let el = t0.elapsed().as_secs_f64();
+        println!(
+            "\nWFM stereo + RDS, {secs} s na {:.3} MSps: {:.2} s CPU -> {:.1}x realtime, {:.1} % jádra",
+            in_rate / 1e6,
+            el,
+            secs / el,
+            el / secs * 100.0
+        );
+        assert!(
+            el < secs * 0.5,
+            "WFM sežral {:.0} % jádra - to je na hraně a bude to ztrácet vzorky",
+            el / secs * 100.0
+        );
+    }
+
+    /// Jádro stereo dekódování: nasyntetizuji plný FM multiplex s pilotem
+    /// a signálem jen v levém kanálu. Na výstupu musí být levý kanál znatelně
+    /// silnější než pravý - jinak se kanály neoddělily.
+    #[test]
+    fn stereo_oddeli_kanaly() {
+        let in_rate = 1_344_000.0;
+        let decim = 28;
+        let mut wfm = WfmDemod::new(in_rate, decim);
+        let mut sq = Squelch::new(48_000.0);
+
+        // L = tón 1 kHz, R = ticho. Multiplex podle normy:
+        // 0,45(L+R) + 0,45(L−R)cos(38k) + 0,1 cos(19k)
+        let tone_hz = 1_000.0;
+        let mut out = Vec::new();
+        let mut ph = 0.0f64; // fáze FM nosné
+        for n in 0..(48_000 * decim) {
+            let t = n as f64 / in_rate;
+            let l = (2.0 * PI * tone_hz * t).sin();
+            let r = 0.0;
+            // Pilot i podnosná jako kosinus: dekodér podnosnou vyrábí ze
+            // vztahu cos(2θ) = 2cos²θ − 1, takže na fázi záleží.
+            let pilot = (2.0 * PI * FM_PILOT_HZ * t).cos();
+            let sub = (2.0 * PI * 2.0 * FM_PILOT_HZ * t).cos();
+            let mpx = 0.45 * (l + r) + 0.45 * (l - r) * sub + 0.1 * pilot;
+            // Multiplex namoduluji na nosnou zdvihem 75 kHz.
+            ph += 2.0 * PI * (FM_DEVIATION_HZ * mpx) / in_rate;
+            wfm.process(
+                Complex32::new(ph.cos() as f32, ph.sin() as f32),
+                &mut out,
+                &mut sq,
+            );
+        }
+
+        assert!(wfm.stereo_active(), "pilot je v signálu, stereo se nepustilo");
+
+        // Na ustálené druhé polovině porovnám sílu kanálů.
+        let pulka = (out.len() / 2) & !1;
+        let (mut el, mut er) = (0.0f64, 0.0f64);
+        for p in out[pulka..].chunks_exact(2) {
+            el += (p[0] * p[0]) as f64;
+            er += (p[1] * p[1]) as f64;
+        }
+        let pomer_db = 10.0 * (el.max(1e-20) / er.max(1e-20)).log10();
+        assert!(
+            pomer_db > 6.0,
+            "oddělení kanálů jen {pomer_db:.1} dB - stereo nefunguje"
+        );
+    }
+
+    /// RDS přes **celý** WFM řetězec: syntetizuji plný multiplex s pilotem
+    /// i RDS podnosnou, namoduluji ho na FM a ověřím, že z toho vypadne název
+    /// stanice.
+    ///
+    /// Testy v `rds.rs` krmí dekodér nosnou 57 kHz napřímo, takže neověří
+    /// to podstatné - jestli si ji přijímač umí sám vyrobit z pilotu.
+    /// Právě tam byla chyba, kvůli které RDS na skutečné stanici mlčelo.
+    #[test]
+    fn rds_projde_celym_retezcem_vcetne_zavesu() {
+        let in_rate = 1_344_000.0;
+        let decim = 28;
+        let mut wfm = WfmDemod::new(in_rate, decim);
+        let mut sq = Squelch::new(48_000.0);
+
+        // Úrovně RDS bitů; biphase se vyrobí až při vzorkování.
+        let urovne = crate::rds::testovaci_urovne(0x2601, b"KNOFLIK ", 24);
+        let spb = in_rate / crate::rds::RDS_BITRATE;
+
+        let mut out = Vec::new();
+        let mut ph = 0.0f64; // fáze FM nosné
+        let vzorku = (urovne.len() as f64 * spb) as usize;
+        for n in 0..vzorku {
+            let t = n as f64 / in_rate;
+            // Zvuk: tón 1 kHz v obou kanálech (mono obsah).
+            let audio = 0.3 * (2.0 * PI * 1_000.0 * t).sin();
+            // Pilot 19 kHz s ~9 % zdvihu.
+            let pilot = 0.09 * (2.0 * PI * FM_PILOT_HZ * t).cos();
+            // RDS: biphase symbol na podnosné 57 kHz, ~3 % zdvihu.
+            let bit = (n as f64 / spb) as usize;
+            let uvnitr = n as f64 / spb - bit as f64;
+            let lvl = urovne.get(bit).copied().unwrap_or(false);
+            let amp = if lvl { 1.0 } else { -1.0 };
+            let symbol = if uvnitr < 0.5 { amp } else { -amp };
+            let rds = 0.03 * symbol * (2.0 * PI * 3.0 * FM_PILOT_HZ * t).cos();
+
+            let mpx = 0.45 * audio + pilot + rds;
+            ph += 2.0 * PI * (FM_DEVIATION_HZ * mpx) / in_rate;
+            wfm.process(
+                Complex32::new(ph.cos() as f32, ph.sin() as f32),
+                &mut out,
+                &mut sq,
+            );
+        }
+
+        let (ok, spatne) = wfm.rds.block_stats();
+        assert!(
+            wfm.pilot_locked,
+            "závěs se nechytil na pilot (bloky {ok}/{})",
+            ok + spatne
+        );
+        assert_eq!(
+            wfm.rds.info().ps,
+            "KNOFLIK",
+            "název se nepřečetl - bloků prošlo {ok}, neprošlo {spatne}"
+        );
+    }
+
+    /// RDS musí projít i vedle **silného sterea**. To je ten skutečný případ:
+    /// rozdílový kanál sahá do 53 kHz, po směšování na 57 kHz padne jeho okraj
+    /// na 4 kHz - tedy hned vedle RDS pásma - a bývá o dvacet dB silnější.
+    /// Se slabou propustí se do dat propere a bloky přestanou procházet.
+    #[test]
+    fn rds_projde_i_vedle_silneho_sterea() {
+        let in_rate = 1_344_000.0;
+        let decim = 28;
+        let mut wfm = WfmDemod::new(in_rate, decim);
+        let mut sq = Squelch::new(48_000.0);
+
+        let urovne = crate::rds::testovaci_urovne(0x2601, b"KNOFLIK ", 24);
+        let spb = in_rate / crate::rds::RDS_BITRATE;
+
+        let mut out = Vec::new();
+        let mut ph = 0.0f64;
+        let vzorku = (urovne.len() as f64 * spb) as usize;
+        for n in 0..vzorku {
+            let t = n as f64 / in_rate;
+            // Rozdílový kanál naplno a s obsahem až u 15 kHz - tedy přesně to,
+            // co po směšování dopadne nejblíž k RDS.
+            let l_minus_r = 0.9 * (2.0 * PI * 14_500.0 * t).sin();
+            let sub = (2.0 * PI * 2.0 * FM_PILOT_HZ * t).cos();
+            let pilot = 0.09 * (2.0 * PI * FM_PILOT_HZ * t).cos();
+
+            let bit = (n as f64 / spb) as usize;
+            let uvnitr = n as f64 / spb - bit as f64;
+            let amp = if urovne.get(bit).copied().unwrap_or(false) {
+                1.0
+            } else {
+                -1.0
+            };
+            let symbol = if uvnitr < 0.5 { amp } else { -amp };
+            // RDS je slabé: ~3 % zdvihu proti 45 % sterea.
+            let rds = 0.03 * symbol * (2.0 * PI * 3.0 * FM_PILOT_HZ * t).cos();
+
+            let mpx = 0.45 * l_minus_r * sub + pilot + rds;
+            ph += 2.0 * PI * (FM_DEVIATION_HZ * mpx) / in_rate;
+            wfm.process(
+                Complex32::new(ph.cos() as f32, ph.sin() as f32),
+                &mut out,
+                &mut sq,
+            );
+        }
+
+        let (ok, spatne) = wfm.rds.block_stats();
+        assert_eq!(
+            wfm.rds.info().ps,
+            "KNOFLIK",
+            "název se nepřečetl vedle silného sterea - bloků prošlo {ok}, neprošlo {spatne}"
+        );
+    }
+
+    /// Bez pilotu se nesmí pustit stereo - jinak by se z šumu kolem 38 kHz
+    /// vyrobil rozdílový kanál a poslech by jen syčel.
+    #[test]
+    fn bez_pilotu_zustava_mono() {
+        let in_rate = 1_344_000.0;
+        let decim = 28;
+        let mut wfm = WfmDemod::new(in_rate, decim);
+        let mut sq = Squelch::new(48_000.0);
+
+        // FM s jedním tónem, žádný pilot na 19 kHz.
+        let mut out = Vec::new();
+        let (mut ph, mut tph) = (0.0f64, 0.0f64);
+        for _ in 0..(48_000 * decim) {
+            let f = 30_000.0 * (2.0 * PI * tph).sin();
+            ph += 2.0 * PI * f / in_rate;
+            tph += 1_000.0 / in_rate;
+            wfm.process(
+                Complex32::new(ph.cos() as f32, ph.sin() as f32),
+                &mut out,
+                &mut sq,
+            );
+        }
+        assert!(!wfm.stereo_active(), "bez pilotu se pustilo stereo");
+        // A oba kanály musí být totožné.
+        let rozdil = out
+            .chunks_exact(2)
+            .map(|p| (p[0] - p[1]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(rozdil < 1e-6, "kanály se liší o {rozdil}");
     }
 }
 
@@ -1146,9 +1944,15 @@ mod tests {
         }
         let mut out = Vec::new();
         rx.process(&iq, &mut out);
-        assert_eq!(out.len(), 48000, "decimace /2 z 96k vzorků");
+        // Prokládané stereo: 48000 rámců = 96000 vzorků.
+        assert_eq!(out.len(), 96000, "decimace /2 z 96k vzorků, prokládaně");
+        // Mono režim musí mít oba kanály shodné.
+        assert!(
+            out.chunks_exact(2).all(|p| p[0] == p[1]),
+            "AM je mono, kanály se musí rovnat"
+        );
         // Po ustálení AGC musí být na výstupu znatelný signál.
-        let tail = &out[24000..];
+        let tail = &out[48000..];
         let rms = (tail.iter().map(|x| x * x).sum::<f32>() / tail.len() as f32).sqrt();
         assert!(rms > 0.05, "RMS demodulovaného tónu = {rms}");
     }

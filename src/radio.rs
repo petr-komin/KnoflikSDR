@@ -4,7 +4,7 @@
 //! [`crate::audio`]; sem už chodí hotové f32.
 
 use crate::decode::{Decoder, RttyConfig};
-use crate::dsp::{Demod, Mode};
+use crate::dsp::{AgcMode, Demod, Mode};
 use crate::settings::Settings;
 use crate::source::{self, Tuner};
 use anyhow::Result;
@@ -25,6 +25,8 @@ pub const AM_BANDWIDTH_HZ: f64 = 8_000.0;
 pub const SSB_BANDWIDTH_HZ: f64 = 2_700.0;
 /// Výchozí šířka pásma pro NFM - amatérský kanál 12,5 kHz s rezervou na zdvih.
 pub const NFM_BANDWIDTH_HZ: f64 = 16_000.0;
+/// Výchozí šířka VKV rozhlasového kanálu - plný Carson, tedy bez ořezu.
+pub const WFM_BANDWIDTH_HZ: f64 = 180_000.0;
 
 /// Meze šířky pásma podle režimu.
 ///
@@ -38,9 +40,10 @@ pub fn bandwidth_range(mode: Mode) -> (f64, f64) {
         Mode::Cw => (CW_MIN_BANDWIDTH_HZ, 2_000.0),
         Mode::Usb | Mode::Lsb => (400.0, 4_000.0),
         Mode::Am => (1_000.0, 24_000.0),
-        // WFM má kanál pevně daný (Carson ~180 kHz), šířka se neladí -
-        // GUI proto u WFM posuvník skrývá. Rozsah je tu jen pro úplnost.
-        Mode::Wfm => (180_000.0, 180_000.0),
+        // WFM: plný kanál je podle Carsona ~180 kHz, ale když sousední stanice
+        // přebíjí, vyplatí se přiškrtit. Pod 120 kHz už ale filtr ukrajuje
+        // i vlastní zdvih a zvuk začne být zkreslený, tak níž ne.
+        Mode::Wfm => (120_000.0, 230_000.0),
         // NFM: od úzkého kanálu (~11 kHz) po širší amatérský (~20 kHz).
         Mode::Nfm => (8_000.0, 20_000.0),
     }
@@ -52,6 +55,13 @@ pub const SQUELCH_MIN_DB: f32 = -100.0;
 pub const SQUELCH_MAX_DB: f32 = -20.0;
 /// Výchozí práh šumové brány - kousek nad typickým šumovým dnem.
 pub const DEFAULT_SQUELCH_DB: f32 = -70.0;
+
+/// Meze ručního zisku při vypnuté AGC. Nahoře dost na slabé signály,
+/// dole tak, aby šla utlumit silná místní stanice.
+pub const AGC_MANUAL_MIN_DB: f32 = 0.0;
+pub const AGC_MANUAL_MAX_DB: f32 = 60.0;
+/// Výchozí ruční zisk - odpovídá zhruba tomu, co dělá AGC na středně silné stanici.
+pub const DEFAULT_AGC_MANUAL_DB: f32 = 20.0;
 
 /// Nejužší poctivý CW filtr. Změřeno: kanálový filtr na 48 kHz s 1023
 /// koeficienty trefí -6 dB bod na hertz přesně až sem; při 100 Hz už
@@ -76,6 +86,14 @@ pub struct Controls {
     pub cw_squelch_db: f32,
     /// Práh šumové brány zvuku v dBFS, nebo `None` když je vypnutá.
     pub squelch_db: Option<f32>,
+    /// Rychlost AGC, případně její vypnutí.
+    pub agc: AgcMode,
+    /// Ruční zisk v dB - uplatní se jen při vypnuté AGC.
+    pub agc_manual_db: f32,
+    /// Kmitočet ruční zádrže na audiu v Hz, nebo `None` když je vypnutá.
+    pub notch_hz: Option<f64>,
+    /// Přehrávat WFM ve stereu, když je slyšet pilot?
+    pub stereo: bool,
 }
 
 impl Default for Controls {
@@ -90,6 +108,10 @@ impl Default for Controls {
             rtty: RttyConfig::default(),
             cw_squelch_db: crate::decode::CW_SQUELCH_DB,
             squelch_db: None,
+            agc: AgcMode::default(),
+            agc_manual_db: DEFAULT_AGC_MANUAL_DB,
+            notch_hz: None,
+            stereo: true,
         }
     }
 }
@@ -127,6 +149,26 @@ pub struct Shared {
     pub level_dbfs: AtomicU32,
     /// Odhadnuté tempo CW ve WPM (bity f32), 0 = neběží CW dekodér.
     pub cw_wpm: AtomicU32,
+    /// Přeje si GUI nahrávat? DSP vlákno podle toho otevře nebo zavře soubor.
+    pub recording: AtomicBool,
+    /// Kam nahrávat. GUI to nastaví, než zvedne `recording`.
+    pub record_path: Mutex<String>,
+    /// Co nahrávání dělá - jméno souboru, chyba, nebo prázdno. Plní DSP vlákno.
+    pub record_status: Mutex<String>,
+    /// Délka běžící nahrávky v sekundách (bity f32).
+    pub record_secs: AtomicU32,
+    /// Hraje WFM zrovna stereo? (Uživatel ho chce a je slyšet pilot.)
+    pub stereo_active: AtomicBool,
+    /// Je chycený stereo pilot? Nezávisle na tom, jestli uživatel chce stereo -
+    /// RDS na pilotu stojí tak jako tak.
+    pub pilot_locked: AtomicBool,
+    /// Naměřená amplituda pilotu (bity f32) - pro diagnostiku, proč RDS mlčí.
+    pub pilot_level: AtomicU32,
+    /// Kolik bloků RDS prošlo kontrolou a kolik ne - taky pro diagnostiku.
+    pub rds_good: AtomicU32,
+    pub rds_bad: AtomicU32,
+    /// Co přečetl RDS - název stanice, RadioText a PI kód.
+    pub rds: Mutex<crate::rds::RdsInfo>,
     /// GUI sem dá nastavení, se kterým se má rádio znovu otevřít (jiné rádio,
     /// vzorkovačka, zvukovka...), a zvedne `reopen`. DSP vlákno to převezme.
     pub reopen_config: Mutex<Option<Settings>>,
@@ -147,6 +189,16 @@ impl Shared {
             sample_rate: AtomicU32::new(96_000),
             level_dbfs: AtomicU32::new((-120.0f32).to_bits()),
             cw_wpm: AtomicU32::new(0f32.to_bits()),
+            recording: AtomicBool::new(false),
+            record_path: Mutex::new(String::new()),
+            record_status: Mutex::new(String::new()),
+            record_secs: AtomicU32::new(0f32.to_bits()),
+            stereo_active: AtomicBool::new(false),
+            pilot_locked: AtomicBool::new(false),
+            pilot_level: AtomicU32::new(0f32.to_bits()),
+            rds_good: AtomicU32::new(0),
+            rds_bad: AtomicU32::new(0),
+            rds: Mutex::new(crate::rds::RdsInfo::default()),
             reopen_config: Mutex::new(None),
             reopen: AtomicBool::new(false),
             running: Arc::new(AtomicBool::new(true)),
@@ -160,9 +212,20 @@ impl Shared {
     pub fn cw_wpm(&self) -> f32 {
         f32::from_bits(self.cw_wpm.load(Ordering::Relaxed))
     }
+
+    pub fn record_secs(&self) -> f32 {
+        f32::from_bits(self.record_secs.load(Ordering::Relaxed))
+    }
 }
 
 /// Kolik vzorků si říct od zdroje najednou.
+/// Kolik vzorků si říct od zdroje najednou.
+///
+/// Zkoušel jsem to škálovat podle vzorkovačky (~5 ms na blok), aby se omezily
+/// hlášky "samples lost" z libmirisdr. Skončilo to pádem ovladače (SIGSEGV)
+/// při přepínání vzorkovačky za běhu - SoapyMiri zjevně nesnese čtení po
+/// blocích výrazně větších, než je jeho USB transfer. Zůstává tedy pevných
+/// 1024; ztráty vzorků jsou věc ovladače a USB, ne velikosti bloku.
 const READ_FRAMES: usize = 1024;
 
 /// Jak často nejvýš přepočítat panorama. Na 96 kHz vychází FFT každých 2048
@@ -235,6 +298,13 @@ fn run(
     let mut audio: Vec<f32> = Vec::with_capacity(1024);
     let mut iq: Vec<Complex32> = Vec::with_capacity(1024);
 
+    // Skutečná vzorkovačka zvuku - pod ní se ukládá WAV.
+    let out_rate = actual_rate / decim as f64;
+    let mut recorder: Option<crate::record::WavWriter> = None;
+    // Mono směs pro nahrávání; drží se mimo smyčku, ať se nealokuje pořád dokola.
+    let mut mono: Vec<f32> = Vec::with_capacity(1024);
+    let mut rds_log = RdsLog::new();
+
     // FFT pro panorama
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(FFT_SIZE);
@@ -252,7 +322,21 @@ fn run(
             continue;
         }
 
-        let (offset, volume, swap, bandwidth, mode, decoder, rtty, squelch, audio_squelch) = {
+        let (
+            offset,
+            volume,
+            swap,
+            bandwidth,
+            mode,
+            decoder,
+            rtty,
+            squelch,
+            audio_squelch,
+            agc,
+            agc_manual_db,
+            notch_hz,
+            stereo,
+        ) = {
             let c = shared.controls.lock().unwrap();
             (
                 c.offset_hz,
@@ -264,6 +348,10 @@ fn run(
                 c.rtty,
                 c.cw_squelch_db,
                 c.squelch_db,
+                c.agc,
+                c.agc_manual_db,
+                c.notch_hz,
+                c.stereo,
             )
         };
         rx.set_offset(offset);
@@ -271,6 +359,9 @@ fn run(
         rx.set_bandwidth(bandwidth);
         rx.set_decoder(decoder, rtty, squelch);
         rx.set_squelch(audio_squelch);
+        rx.set_agc(agc, agc_manual_db);
+        rx.set_notch(notch_hz);
+        rx.set_stereo(stereo);
 
         iq.clear();
         iq.extend(raw[..frames].iter().map(|c| {
@@ -327,6 +418,35 @@ fn run(
             Ordering::Relaxed,
         );
 
+        // Stav stereo a RDS pro GUI. RDS se přepisuje jen když se změnil,
+        // ať se GUI nebere zámek na každém bloku vzorků zbytečně.
+        shared
+            .stereo_active
+            .store(rx.stereo_active(), Ordering::Relaxed);
+        shared
+            .pilot_locked
+            .store(rx.pilot_locked(), Ordering::Relaxed);
+        shared
+            .pilot_level
+            .store(rx.pilot_level().to_bits(), Ordering::Relaxed);
+        let (rds_ok, rds_bad) = rx.rds_blocks();
+        shared.rds_good.store(rds_ok, Ordering::Relaxed);
+        shared.rds_bad.store(rds_bad, Ordering::Relaxed);
+
+        // Diagnostický záznam WFM/RDS. Zapíná se proměnnou prostředí, ať
+        // konzoli nezaplavuje - ta je od ovladače hlučná i bez nás.
+        if let Some(log) = rds_log.as_mut() {
+            log.tick(&rx, mode);
+        }
+        if mode.is_wfm() {
+            let info = rx.rds();
+            if let Ok(mut r) = shared.rds.try_lock() {
+                if *r != *info {
+                    *r = info.clone();
+                }
+            }
+        }
+
         // Přečtený text předáme GUI. Kdyby si ho nikdo nebral, necháme
         // ho useknout, ať paměť neroste donekonečna.
         let text = rx.take_text();
@@ -339,12 +459,192 @@ fn run(
                 }
             }
         }
-        for s in &audio {
-            // Když ring přeteče, vzorek zahodíme - výstup si drží tempo sám.
-            let _ = audio_tx.push(s * volume);
+        // Nahrávání. Ukládá se zvuk před regulací hlasitosti, ať nahrávka
+        // nezávisí na tom, jak je zrovna stažený knoflík. WAV je mono, tak
+        // se stereo dvojice smíchá; u mono režimů jsou oba kanály stejné,
+        // takže se nic nezmění.
+        if shared.recording.load(Ordering::Relaxed) || recorder.is_some() {
+            mono.clear();
+            mono.extend(audio.chunks_exact(2).map(|p| (p[0] + p[1]) * 0.5));
+            run_recorder(&shared, &mut recorder, out_rate, &mono);
+        }
+
+        // Zvuk chodí jako prokládané dvojice L, R. Do ringu se strkají celé
+        // dvojice: kdyby se vešla jen půlka, prohodily by se od té chvíle
+        // kanály natrvalo.
+        for pair in audio.chunks_exact(2) {
+            if audio_tx.slots() < 2 {
+                break; // ring plný - zbytek zahodíme, výstup si drží tempo sám
+            }
+            let _ = audio_tx.push(pair[0] * volume);
+            let _ = audio_tx.push(pair[1] * volume);
         }
     }
+    // Když se vlákno končí (zavřené okno, přepnutí rádia), nahrávku pořádně
+    // uzavřeme - jinak by v hlavičce zůstaly nuly a soubor by byl nepoužitelný.
+    if let Some(w) = recorder.take() {
+        let _ = w.finish();
+    }
     Ok(())
+}
+
+/// Diagnostický záznam stavu WFM a RDS.
+///
+/// Ladit RDS "podle toho, co je vidět v okně" nejde - ukazatel řekne jen
+/// "hledám" a člověk pak hádá, jestli je problém v pilotu, v nosné, v taktu
+/// nebo v síle signálu. Tenhle záznam píše jednou za vteřinu tvrdá čísla.
+///
+/// Zapíná se proměnnou `KNOFLIK_RDS_LOG`: buď cesta k souboru, nebo `1`
+/// pro výpis na chybový výstup. Ve výchozím stavu neběží vůbec.
+struct RdsLog {
+    out: Option<Box<dyn std::io::Write + Send>>,
+    last: std::time::Instant,
+    /// Počty z minulého záznamu, aby šlo spočítat přírůstek za vteřinu.
+    prev_ok: u32,
+    prev_bad: u32,
+}
+
+impl RdsLog {
+    fn new() -> Option<Self> {
+        let kam = std::env::var("KNOFLIK_RDS_LOG").ok()?;
+        let out: Box<dyn std::io::Write + Send> = if kam == "1" {
+            Box::new(std::io::stderr())
+        } else {
+            match std::fs::File::create(&kam) {
+                Ok(f) => Box::new(std::io::BufWriter::new(f)),
+                Err(e) => {
+                    eprintln!("RDS log: {kam} nejde otevřít: {e}");
+                    return None;
+                }
+            }
+        };
+        eprintln!("RDS log zapnut -> {kam}");
+        Some(RdsLog {
+            out: Some(out),
+            last: std::time::Instant::now(),
+            prev_ok: 0,
+            prev_bad: 0,
+        })
+    }
+
+    fn tick(&mut self, rx: &Demod, mode: Mode) {
+        if !mode.is_wfm() || self.last.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last = std::time::Instant::now();
+        let Some(out) = self.out.as_mut() else {
+            return;
+        };
+        let (ok, bad) = rx.rds_blocks();
+        let (d_ok, d_bad) = (ok.wrapping_sub(self.prev_ok), bad.wrapping_sub(self.prev_bad));
+        self.prev_ok = ok;
+        self.prev_bad = bad;
+        let info = rx.rds();
+        let (oko, syncu, drzi) = rx.rds_quality();
+        // Podíl prošlých bloků za poslední vteřinu je to hlavní číslo:
+        // pod ~50 % se název stanice prakticky nesloží, protože skupina
+        // potřebuje platné bloky A, B i D najednou.
+        let celkem = d_ok + d_bad;
+        let podil = if celkem > 0 {
+            d_ok as f32 / celkem as f32 * 100.0
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            out,
+            "{} | signál {:6.1} dBFS | pilot {:.4} {} | stereo {} | bloky {:3}/{:3} ({:5.1} %) | oko {:.2} | sync {:3}{} | PI {} | PS {:?} | RT {:?}",
+            chrono::Local::now().format("%H:%M:%S"),
+            rx.level_dbfs(),
+            rx.pilot_level(),
+            if rx.pilot_locked() { "OK " } else { "-- " },
+            if rx.stereo_active() { "ANO" } else { "ne " },
+            d_ok,
+            celkem,
+            podil,
+            oko,
+            syncu,
+            if drzi { "*" } else { " " },
+            match info.pi {
+                Some(pi) => format!("{pi:04X}"),
+                None => "----".to_string(),
+            },
+            info.ps,
+            info.rt,
+        );
+        let _ = out.flush();
+    }
+}
+
+/// Otevře, krmí nebo zavře nahrávku podle toho, co si přeje GUI.
+///
+/// Běží v DSP vlákně, takže se chyba nesmí propsat výš - zápis do souboru
+/// nesmí shodit příjem. Když se něco nepovede, řekne se to do stavu a
+/// nahrávání se vypne.
+fn run_recorder(
+    shared: &Arc<Shared>,
+    recorder: &mut Option<crate::record::WavWriter>,
+    out_rate: f64,
+    audio: &[f32],
+) {
+    let chce = shared.recording.load(Ordering::Relaxed);
+    match (chce, recorder.is_some()) {
+        // Začít nahrávat.
+        (true, false) => {
+            let path = shared.record_path.lock().unwrap().clone();
+            match crate::record::WavWriter::create(&path, out_rate as u32) {
+                Ok(w) => {
+                    *shared.record_status.lock().unwrap() = format!(
+                        "nahrávám {}",
+                        w.path()
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or(path.clone())
+                    );
+                    *recorder = Some(w);
+                }
+                Err(e) => {
+                    *shared.record_status.lock().unwrap() = format!("nahrávání selhalo: {e}");
+                    shared.recording.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+        // Dopsat a zavřít.
+        (false, true) => {
+            if let Some(w) = recorder.take() {
+                let secs = w.seconds();
+                match w.finish() {
+                    Ok(p) => {
+                        *shared.record_status.lock().unwrap() = format!(
+                            "uloženo {} ({:.0} s)",
+                            p.file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default(),
+                            secs
+                        )
+                    }
+                    Err(e) => {
+                        *shared.record_status.lock().unwrap() = format!("uložení selhalo: {e}")
+                    }
+                }
+            }
+            shared.record_secs.store(0f32.to_bits(), Ordering::Relaxed);
+        }
+        // Nahrávat dál.
+        (true, true) => {
+            if let Some(w) = recorder.as_mut() {
+                if let Err(e) = w.write(audio) {
+                    *shared.record_status.lock().unwrap() = format!("zápis selhal: {e}");
+                    shared.recording.store(false, Ordering::Relaxed);
+                    *recorder = None;
+                } else {
+                    shared
+                        .record_secs
+                        .store(w.seconds().to_bits(), Ordering::Relaxed);
+                }
+            }
+        }
+        (false, false) => {}
+    }
 }
 
 #[cfg(all(test, feature = "rsp1"))]

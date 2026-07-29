@@ -18,6 +18,13 @@ jeden statický binár místo Pythonu s C rozšířením.
 - **Panorama a vodopád** přes celou vzorkovací frekvenci, s mřížkou v dB a kHz
 - **Šumová brána (squelch)** pro všechny režimy — umlčí zvuk pod nastaveným prahem, ať mezi
   stanicemi nesyčí; práh je vidět jako vodorovnou čáru v panoramatu
+- **Nastavitelná AGC** — rychlá (CW), střední, pomalá (SSB a AM), nebo vypnutá s ručním ziskem
+- **Ruční notch** — úzká zádrž na heterodynní pískot, běží před AGC a značí se ve spektru
+- **Skenování** — projíždí oblíbené nebo viditelný výřez a zastaví, když signál otevře bránu
+- **Nahrávání do WAV** — 48 kHz, 16 bit; ukládá se před hlasitostí, tak ji knoflík neovlivní
+- **WFM stereo a RDS** — pilot 19 kHz pustí dvoukanálový zvuk, z 57 kHz se čte název
+  stanice a RadioText; šířka mezifrekvenční propusti (120–230 kHz) jde přiškrtit,
+  když sousední stanice přebíjí
 - **Bandplan i pro VKV/UHF** — s RSP1 se ladí souvisle do 2 GHz; vyznačená amatérská pásma
   6 m / 2 m / 70 cm / 23 cm, FM rozhlas i orientační DAB/DVB-T
 - **Velké skoky ladění** — na RSP1 tlačítka ±10 k / ±100 k / ±1 M kHz, na SoftRocku jemná
