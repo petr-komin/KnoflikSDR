@@ -248,6 +248,16 @@ impl RdsDecoder {
         &self.info
     }
 
+    /// Zahodí všechno rozečtené a začne od nuly.
+    ///
+    /// Volá se při přeladění na jinou stanici: název i RadioText patří té
+    /// předchozí a nechat je viset by lhalo. Koeficienty filtrů zůstávají,
+    /// mění se jen stav - vzorkovačka je pořád stejná.
+    pub fn reset(&mut self) {
+        let if_rate = self.samples_per_bit * RDS_BITRATE;
+        *self = RdsDecoder::new(if_rate);
+    }
+
     /// Kolik bloků prošlo kontrolou a kolik ne. Pro diagnostiku: když
     /// neprochází vůbec nic, je chyba v demodulaci nebo v taktu; když
     /// prochází část, jde jen o slabý signál.

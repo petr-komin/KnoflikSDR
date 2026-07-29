@@ -164,9 +164,21 @@ pub struct Shared {
     pub pilot_locked: AtomicBool,
     /// Naměřená amplituda pilotu (bity f32) - pro diagnostiku, proč RDS mlčí.
     pub pilot_level: AtomicU32,
+    /// Odchylka krystalu v ppm změřená na stereo pilotu (bity f32).
+    /// NaN, dokud není co měřit. Slouží ke kalibraci stupnice.
+    pub pilot_ppm: AtomicU32,
+    /// GUI žádá o přesné změření kmitočtu tónu na výstupu (kalibrace podle
+    /// normálu v CW). DSP vlákno nasbírá vzorky, spočítá FFT a výsledek
+    /// uloží do `cal_tone_hz`.
+    pub cal_request: AtomicBool,
+    /// Změřený kmitočet audio tónu v Hz (bity f32), NaN dokud se neměřilo.
+    pub cal_tone_hz: AtomicU32,
     /// Kolik bloků RDS prošlo kontrolou a kolik ne - taky pro diagnostiku.
     pub rds_good: AtomicU32,
     pub rds_bad: AtomicU32,
+    /// GUI tím říká "přeladili jsme, zapomeň RDS". Nastaví se při hrubém
+    /// přeladění; DSP vlákno dekodér vynuluje a příznak shodí.
+    pub rds_reset: AtomicBool,
     /// Co přečetl RDS - název stanice, RadioText a PI kód.
     pub rds: Mutex<crate::rds::RdsInfo>,
     /// GUI sem dá nastavení, se kterým se má rádio znovu otevřít (jiné rádio,
@@ -196,8 +208,12 @@ impl Shared {
             stereo_active: AtomicBool::new(false),
             pilot_locked: AtomicBool::new(false),
             pilot_level: AtomicU32::new(0f32.to_bits()),
+            pilot_ppm: AtomicU32::new(f32::NAN.to_bits()),
+            cal_request: AtomicBool::new(false),
+            cal_tone_hz: AtomicU32::new(f32::NAN.to_bits()),
             rds_good: AtomicU32::new(0),
             rds_bad: AtomicU32::new(0),
+            rds_reset: AtomicBool::new(false),
             rds: Mutex::new(crate::rds::RdsInfo::default()),
             reopen_config: Mutex::new(None),
             reopen: AtomicBool::new(false),
@@ -304,9 +320,12 @@ fn run(
     // Mono směs pro nahrávání; drží se mimo smyčku, ať se nealokuje pořád dokola.
     let mut mono: Vec<f32> = Vec::with_capacity(1024);
     let mut rds_log = RdsLog::new();
+    // Zásobník na kalibrační měření tónu; plní se, jen když si GUI řekne.
+    let mut cal_buf: Vec<f32> = Vec::new();
 
-    // FFT pro panorama
+    // FFT pro panorama a zvlášť delší pro kalibrační měření tónu.
     let mut planner = FftPlanner::<f32>::new();
+    let cal_fft = planner.plan_fft_forward(CAL_FFT);
     let fft = planner.plan_fft_forward(FFT_SIZE);
     let window: Vec<f32> = (0..FFT_SIZE)
         .map(|i| 0.5 - 0.5 * (2.0 * PI * i as f32 / (FFT_SIZE - 1) as f32).cos())
@@ -362,6 +381,16 @@ fn run(
         rx.set_agc(agc, agc_manual_db);
         rx.set_notch(notch_hz);
         rx.set_stereo(stereo);
+
+        // Přeladili jsme na jinou stanici - co se přečetlo, patří té minulé.
+        if shared.rds_reset.swap(false, Ordering::Relaxed) {
+            rx.reset_rds();
+            if let Ok(mut r) = shared.rds.lock() {
+                *r = crate::rds::RdsInfo::default();
+            }
+            shared.rds_good.store(0, Ordering::Relaxed);
+            shared.rds_bad.store(0, Ordering::Relaxed);
+        }
 
         iq.clear();
         iq.extend(raw[..frames].iter().map(|c| {
@@ -429,6 +458,10 @@ fn run(
         shared
             .pilot_level
             .store(rx.pilot_level().to_bits(), Ordering::Relaxed);
+        shared.pilot_ppm.store(
+            (rx.pilot_ppm().unwrap_or(f64::NAN) as f32).to_bits(),
+            Ordering::Relaxed,
+        );
         let (rds_ok, rds_bad) = rx.rds_blocks();
         shared.rds_good.store(rds_ok, Ordering::Relaxed);
         shared.rds_bad.store(rds_bad, Ordering::Relaxed);
@@ -459,6 +492,20 @@ fn run(
                 }
             }
         }
+        // Kalibrace: nasbírat kus zvuku a změřit kmitočet tónu. Bere se levý
+        // kanál z prokládané dvojice.
+        if shared.cal_request.load(Ordering::Relaxed) {
+            cal_buf.extend(audio.chunks_exact(2).map(|p| p[0]));
+            if cal_buf.len() >= CAL_FFT {
+                let ton = zmer_ton(&cal_buf, out_rate, &cal_fft);
+                shared.cal_tone_hz.store(ton.to_bits(), Ordering::Relaxed);
+                shared.cal_request.store(false, Ordering::Relaxed);
+                cal_buf.clear();
+            }
+        } else if !cal_buf.is_empty() {
+            cal_buf.clear();
+        }
+
         // Nahrávání. Ukládá se zvuk před regulací hlasitosti, ať nahrávka
         // nezávisí na tom, jak je zrovna stažený knoflík. WAV je mono, tak
         // se stereo dvojice smíchá; u mono režimů jsou oba kanály stejné,
@@ -486,6 +533,47 @@ fn run(
         let _ = w.finish();
     }
     Ok(())
+}
+
+/// Kolik vzorků zvuku vzít na změření kmitočtu tónu při kalibraci.
+///
+/// 32768 vzorků při 48 kHz je 0,68 s, tedy hrubé rozlišení 1,46 Hz. Špička
+/// se ale ještě proloží parabolou přes sousední biny, což to zpřesní zhruba
+/// na desetinu binu. Na 10 MHz normálu to vyjde kolem 0,02 ppm - o tři řády
+/// líp než odečet z panoramatu, kde je bin široký stovky hertzů.
+const CAL_FFT: usize = 32_768;
+
+/// Změří kmitočet nejsilnějšího tónu ve zvuku.
+///
+/// Používá se ke kalibraci proti normálu: v CW leží nosná přesně na tónu
+/// `CW_PITCH_HZ`, takže odchylka tónu je přímo chyba ladění.
+fn zmer_ton(audio: &[f32], rate: f64, fft: &std::sync::Arc<dyn rustfft::Fft<f32>>) -> f32 {
+    let n = CAL_FFT;
+    // Hannovo okno, ať špička neroztéká do sousedních binů.
+    let mut buf: Vec<Complex32> = audio[audio.len() - n..]
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| {
+            let w = 0.5 - 0.5 * (2.0 * PI * i as f32 / (n - 1) as f32).cos();
+            Complex32::new(s * w, 0.0)
+        })
+        .collect();
+    fft.process(&mut buf);
+
+    let mag: Vec<f32> = buf[..n / 2].iter().map(|c| c.norm()).collect();
+    let Some(k) = (1..n / 2 - 1).max_by(|&a, &b| mag[a].partial_cmp(&mag[b]).unwrap()) else {
+        return f32::NAN;
+    };
+    // Proložení parabolou přes tři biny kolem špičky - poloha vrcholu vyjde
+    // s přesností hluboko pod šířku binu.
+    let (l, c, r) = (mag[k - 1], mag[k], mag[k + 1]);
+    let jmenovatel = l - 2.0 * c + r;
+    let posun = if jmenovatel.abs() > 1e-20 {
+        0.5 * (l - r) / jmenovatel
+    } else {
+        0.0
+    };
+    (k as f32 + posun) * rate as f32 / n as f32
 }
 
 /// Diagnostický záznam stavu WFM a RDS.

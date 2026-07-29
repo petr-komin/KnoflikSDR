@@ -36,6 +36,11 @@ const PARK_OFFSET_HZ: f64 = 10_000.0;
 const SNAP_DELAY_MS: u64 = 400;
 /// Nejvyšší přiblížení panoramatu. Nad tím už je vidět jen rozmazaný jeden bin.
 const MAX_ZOOM: f32 = 32.0;
+/// O kolik se smí přeladit, aby přečtené RDS ještě platilo. VKV rozhlas má
+/// kanály po 100 kHz, takže půlka rozestupu je bezpečná mez: doladění téže
+/// stanice se do ní vejde, skok na jinou už ne.
+const RDS_KEEP_KHZ: f64 = 50.0;
+
 /// Jak daleko od naladěné frekvence hledat v rozpisu. Pokrývá nepřesnost
 /// ladění i to, že se stanice od rozpisu občas o kousek liší.
 const SCHEDULE_TOLERANCE_KHZ: f64 = 2.0;
@@ -232,6 +237,9 @@ struct App {
     /// Vše, co se ukládá, drží rovnou Settings - jediný zdroj pravdy.
     set: Settings,
     vfo_input: String,
+    /// Textové pole pro přímé zadání naladěné frekvence. Ladit jen kolečkem
+    /// nestačí - na normál se člověk musí trefit přesně, ne po krocích.
+    tuned_input: String,
     /// Střed viditelného výřezu panoramatu v Hz od VFO. Odděleně od naladění
     /// (`offset_hz`), aby se při zoomu značka pohybovala a spektrum stálo,
     /// místo aby se pořád vycentrovávalo. Neukládá se.
@@ -262,6 +270,12 @@ struct App {
     autosave: Autosave,
     /// Běžící skener, nebo `None`. Neukládá se - po startu se nikdy neskenuje.
     scan: Option<Scan>,
+    /// Kde jsme byli, když se naposled sahalo na RDS. Podle změny se pozná,
+    /// že jsme přeladili na jinou stanici a přečtený text už neplatí.
+    rds_khz: f64,
+    /// Skutečná frekvence normálu, proti kterému se kalibruje. Neukládá se.
+    cal_true_khz: f64,
+
 }
 
 /// Co skener projíždí.
@@ -318,6 +332,7 @@ impl App {
             gain_tx,
             set: s.clone(),
             vfo_input: format!("{:.1}", s.vfo_khz),
+            tuned_input: format!("{:.3}", s.vfo_khz + s.offset_hz / 1000.0),
             view_center_hz: s.offset_hz,
             drag_bw: false,
             show_manage: false,
@@ -332,6 +347,8 @@ impl App {
             last_generation: 0,
             autosave: Autosave::new(s),
             scan: None,
+            rds_khz: 0.0,
+            cal_true_khz: 4996.0,
         }
     }
 
@@ -417,8 +434,14 @@ impl App {
 
     fn set_zoom(&mut self, z: f32) {
         self.set.zoom = z.clamp(1.0, MAX_ZOOM);
-        // Po změně přiblížení ať naladěná stanice zůstane v obraze.
-        self.keep_offset_visible(self.span_hz());
+        // Přibližuje se k naladěné stanici, ne k tomu, co je zrovna uprostřed.
+        //
+        // Dřív se jen hlídalo, aby značka nevypadla z obrazu - jenže to ji při
+        // přiblížení posadilo těsně k okraji a stanice "ujížděla pryč".
+        // Přiblížení má zvětšit to, co posloucháš, tak ať se to zvětšuje kolem
+        // toho. U kraje zachyceného spektra se výřez zastaví (viz `view_window`),
+        // takže se značka od středu odchýlí jen tam, kde dál data nejsou.
+        self.center_view_on_tuned();
     }
 
     /// Posune průzor tak, aby naladěná frekvence (`offset_hz`) byla vidět.
@@ -443,7 +466,9 @@ impl App {
         if self.set.mode.is_wfm() {
             // FM stanice jsou po ~100 kHz, jemnější krok kolečka nemá smysl.
             100_000.0
-        } else if self.set.mode.is_ssb() {
+        } else if self.set.mode.is_ssb() || self.set.mode == dsp::Mode::Cw {
+            // SSB i CW se ladí do hertzů - u CW proto, že se zanáší na zázněj
+            // a při kalibraci proti normálu je stovka hertzů úplně mimo.
             10.0
         } else {
             100.0
@@ -617,6 +642,158 @@ impl App {
             None
         };
         c.stereo = self.set.stereo;
+    }
+
+    /// Kalibrace stupnice RSP1.
+    ///
+    /// Krystal se u každého kusu trochu liší a z něj jede vzorkovačka
+    /// i směšovací oscilátor. Chyba je proto relativní - jedna hodnota v ppm
+    /// srovná stupnici na krátkých vlnách i na VKV.
+    ///
+    /// Měřit ji nemusíš podle žádného normálu: stereo pilot VKV rozhlasu je
+    /// přesně 19 kHz z normálu vysílače a měříme ho až za demodulací, takže
+    /// jeho zdánlivá odchylka závisí jen na tvé vzorkovačce - tedy přímo na
+    /// tom krystalu.
+    fn rsp1_calibration(&mut self, ui: &mut egui::Ui) {
+        let zmereno = f32::from_bits(self.shared.pilot_ppm.load(Ordering::Relaxed));
+        let mut zmena = false;
+        egui::Grid::new("rsp1_grid")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("odchylka krystalu [ppm]:");
+                ui.horizontal(|ui| {
+                    let r = ui.add(
+                        egui::DragValue::new(&mut self.set.rsp1_ppm)
+                            .speed(0.1)
+                            .range(-100.0..=100.0)
+                            .fixed_decimals(2),
+                    );
+                    // Ladicí vlákno drží ppm z doby otevření, takže se změna
+                    // projeví až po znovuotevření. Nechává se to na konec
+                    // tažení, ať se rádio nerestartuje na každý pixel.
+                    if r.drag_stopped() || r.lost_focus() {
+                        zmena = true;
+                    }
+                    if ui.button("vynulovat").clicked() {
+                        self.set.rsp1_ppm = 0.0;
+                        zmena = true;
+                    }
+                });
+                ui.end_row();
+
+                ui.label("změřeno z pilotu:");
+                ui.horizontal(|ui| {
+                    if zmereno.is_finite() {
+                        ui.label(
+                            egui::RichText::new(format!("{zmereno:+.2} ppm"))
+                                .color(egui::Color32::from_rgb(80, 200, 90))
+                                .strong(),
+                        );
+                        // Měření je relativní k současnému nastavení, takže
+                        // se zbytková odchylka přičítá k tomu, co už platí.
+                        if ui
+                            .button("použít")
+                            .on_hover_text("převzít naměřenou hodnotu do kalibrace")
+                            .clicked()
+                        {
+                            self.set.rsp1_ppm += zmereno as f64;
+                            zmena = true;
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("nalaď stereo stanici na VKV").weak(),
+                        );
+                    }
+                });
+                ui.end_row();
+
+                // Poctivá metoda: proti normálu naladěnému v CW.
+                //
+                // Odečet z panoramatu by nestačil - bin je při 1,344 MSps
+                // široký 656 Hz, což je na 10 MHz normálu 65 ppm, tedy víc
+                // než měřená chyba. Proto se měří kmitočet audio tónu, kde
+                // je rozlišení o tři řády jemnější.
+                ui.label("podle normálu (v CW):");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.cal_true_khz)
+                            .speed(1.0)
+                            .range(100.0..=2_000_000.0)
+                            .suffix(" kHz"),
+                    )
+                    .on_hover_text("skutečná frekvence normálu, na který jsi naladěný");
+                    let bezi = self.shared.cal_request.load(Ordering::Relaxed);
+                    let lze = self.set.mode == dsp::Mode::Cw;
+                    ui.add_enabled_ui(lze && !bezi, |ui| {
+                        if ui.button("změřit").clicked() {
+                            self.shared
+                                .cal_tone_hz
+                                .store(f32::NAN.to_bits(), Ordering::Relaxed);
+                            self.shared.cal_request.store(true, Ordering::Relaxed);
+                        }
+                    })
+                    .response
+                    .on_hover_text(if lze {
+                        "změří kmitočet tónu a porovná s nastaveným pitchem"
+                    } else {
+                        "přepni do CW - nosná normálu pak leží přesně na tónu"
+                    });
+                    if bezi {
+                        ui.label(egui::RichText::new("měřím…").weak());
+                    }
+                    let ton = f32::from_bits(self.shared.cal_tone_hz.load(Ordering::Relaxed));
+                    if ton.is_finite() {
+                        // Kde nosná doopravdy leží: v CW dá nosná na naladěné
+                        // frekvenci tón přesně CW_PITCH_HZ, takže odchylka tónu
+                        // je posun nosné proti stupnici.
+                        //
+                        // Do výpočtu jde **skutečná** naladěná frekvence, ne ta
+                        // nominální. Kdyby se předpokládalo, že jsi trefil
+                        // nominál na hertz přesně, promítlo by se každé
+                        // nedoladění rovnou do kalibrace - a pár desítek hertzů
+                        // je na 10 MHz několik ppm.
+                        let dial_hz = self.tuned_khz() * 1000.0;
+                        let nominal_hz = self.cal_true_khz * 1000.0;
+                        let nosna_hz = dial_hz + (ton as f64 - dsp::CW_PITCH_HZ);
+                        let ppm = ppm_z_normalu(dial_hz, nominal_hz, ton as f64);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "nosná {:.1} Hz ({:+.1} Hz od nominálu) → {ppm:+.2} ppm",
+                                nosna_hz,
+                                nosna_hz - nominal_hz
+                            ))
+                            .color(egui::Color32::from_rgb(80, 200, 90)),
+                        );
+                        if ui.button("použít ").clicked() {
+                            self.set.rsp1_ppm += ppm;
+                            self.shared
+                                .cal_tone_hz
+                                .store(f32::NAN.to_bits(), Ordering::Relaxed);
+                            zmena = true;
+                        }
+                    }
+                });
+                ui.end_row();
+            });
+        ui.label(
+            egui::RichText::new(
+                "Podle nosné je to poctivé: nalaď normál se zaručenou přesností (DCF77 na\n\
+                 77,5 kHz, RWM na 4996/9996/14996 kHz, WWV, CHU), zadej jeho frekvenci\n\
+                 a dej „změřit“. Přibliž si zoom, ať je špička odečtená přesně.\n\
+                 \n\
+                 Pilot 19 kHz je jen rychlá orientace: norma mu povoluje ±2 Hz, což je\n\
+                 ±105 ppm - horší, než bývá chyba samotného krystalu. V praxi jsou vysílače\n\
+                 navázané na GPS a drží mnohem líp, ale zaručené to není. Než se na pilot\n\
+                 spolehneš, změř ho na několika stanicích: když se shodnou, sedí.\n\
+                 \n\
+                 Jedna hodnota platí pro KV i VKV - chyba krystalu je relativní.",
+            )
+            .weak(),
+        );
+        if zmena {
+            self.request_reopen();
+        }
     }
 
     /// Stereo u VKV rozhlasu. Název stanice a stav stereo se ukazují nahoře
@@ -1402,6 +1579,13 @@ impl App {
                     self.devices = None;
                 }
 
+                if self.set.hardware == source::Hardware::Rsp1 {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.heading("SDRplay RSP1");
+                    self.rsp1_calibration(ui);
+                }
+
                 if self.set.hardware.uses_si570() {
                     ui.add_space(8.0);
                     ui.separator();
@@ -1682,6 +1866,21 @@ impl App {
     }
 }
 
+/// Odchylka krystalu v ppm z měření nosné normálu.
+///
+/// `dial_hz` je frekvence, na které přijímač **stojí** (podle své stupnice),
+/// `nominal_hz` skutečná frekvence normálu a `ton_hz` změřený kmitočet tónu
+/// v CW. Nosná naladěná přesně dá tón `CW_PITCH_HZ`, takže odchylka tónu
+/// říká, kde nosná proti stupnici leží.
+///
+/// Klíčové je, že se počítá proti skutečnému naladění, ne proti nominálu -
+/// jinak by se každé nedoladění připočetlo k chybě krystalu. Pár desítek
+/// hertzů vedle je na 10 MHz několik ppm, tedy víc než měřená veličina.
+fn ppm_z_normalu(dial_hz: f64, nominal_hz: f64, ton_hz: f64) -> f64 {
+    let nosna_hz = dial_hz + (ton_hz - dsp::CW_PITCH_HZ);
+    (nominal_hz - nosna_hz) / dial_hz * 1e6
+}
+
 /// Ořízne text na danou délku a přidá výpustku. Řez padne na hranici znaku,
 /// jinak by to na diakritice panikařilo.
 fn zkrat(s: &str, max: usize) -> String {
@@ -1890,6 +2089,19 @@ impl eframe::App for App {
         // ať je hned vidět, kde stojí.
         self.scan_tick(span_hz);
 
+        // Přeladili jsme jinam? Pak přečtené RDS patří předchozí stanici a
+        // musí pryč - jinak by u nové svítil cizí název a cizí text.
+        // Práh je půl rozestupu kanálů: menší posun je doladění téže stanice.
+        let ted_khz = self.set.vfo_khz + self.set.offset_hz / 1000.0;
+        if (ted_khz - self.rds_khz).abs() > RDS_KEEP_KHZ {
+            self.rds_khz = ted_khz;
+            self.shared.rds_reset.store(true, Ordering::Relaxed);
+            // Ať to zmizí hned, ne až doběhne DSP vlákno.
+            if let Ok(mut r) = self.shared.rds.lock() {
+                *r = rds::RdsInfo::default();
+            }
+        }
+
         let tuned_khz = self.set.vfo_khz + self.set.offset_hz / 1000.0;
 
         egui::Panel::top("ovladani").show(ui, |ui| {
@@ -1943,11 +2155,27 @@ impl eframe::App for App {
                     self.jump_window(span_hz, 1.0);
                 }
                 ui.separator();
-                ui.label(
-                    egui::RichText::new(format!("naladěno {tuned_khz:.2} kHz"))
-                        .size(18.0)
-                        .strong(),
+                // Naladěná frekvence jde přímo přepsat. Ladit jen kolečkem
+                // nestačí: na normál se člověk musí trefit přesně, ne po
+                // krocích, a naladěno = VFO + offset, takže to zadání VFO
+                // neumí.
+                ui.label(egui::RichText::new("naladěno").size(18.0).strong());
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.tuned_input)
+                        .desired_width(100.0)
+                        .font(egui::TextStyle::Heading),
                 );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if let Ok(v) = self.tuned_input.trim().replace(',', ".").parse::<f64>() {
+                        let bw = self.bandwidth_hz();
+                        self.tune_to(v, self.set.mode, bw);
+                    }
+                }
+                // Dokud v poli nepíšeš, ukazuje aktuální ladění.
+                if !resp.has_focus() {
+                    self.tuned_input = format!("{tuned_khz:.3}");
+                }
+                ui.label(egui::RichText::new("kHz").size(18.0).strong());
                 // Název stanice z RDS patří rovnou k naladěné frekvenci - je
                 // to totéž, co u AM ukazuje rozpis EiBi, jen přímo z éteru.
                 //
@@ -2682,6 +2910,73 @@ mod tests {
             bins[idx] = db;
         }
         bins
+    }
+
+    /// Přiblížení se musí soustředit na naladěnou stanici.
+    ///
+    /// Dřív se jen hlídalo, že značka nevypadne z obrazu, což ji při zoomu
+    /// posadilo těsně k okraji - stanice pak "ujížděla pryč". Tady se ověřuje,
+    /// že po vycentrování zůstane naladění uvnitř výřezu, a to i u kraje
+    /// spektra, kde se průzor zaráží a doprostřed ho posadit nejde.
+    #[test]
+    fn zoom_soustredi_pohled_na_ladeni() {
+        const SPAN: f64 = 1_344_000.0;
+        for zoom in [1.0f32, 2.0, 4.0, 8.0, 16.0, 32.0] {
+            for offset in [0.0f64, 1_000.0, -50_000.0, 300_000.0, -660_000.0, 671_000.0] {
+                // Vycentrování na naladění, pak výřez se zarážkou u kraje.
+                let (c, vis) = view_window(zoom, offset, SPAN);
+                let lo = c - vis / 2.0;
+                let hi = c + vis / 2.0;
+                // Naladění musí být vidět - s drobnou rezervou na kraj spektra.
+                let uvnitr_spektra = offset.abs() <= SPAN / 2.0;
+                if uvnitr_spektra {
+                    assert!(
+                        offset >= lo - 1.0 && offset <= hi + 1.0,
+                        "zoom {zoom}x, offset {offset}: výřez {lo}..{hi} naladění nezahrnuje"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Kalibrace nesmí záviset na tom, jestli jsi trefil nominál na hertz.
+    ///
+    /// Tohle byla skutečná vada: vzorec předpokládal ladění přesně na
+    /// nominál, takže se každé nedoladění připočetlo k chybě krystalu.
+    /// Dvě měření téhož rádia na 10 MHz a 9996 kHz pak vyšla o 2,4 ppm jinak.
+    #[test]
+    fn kalibrace_nezavisi_na_presnosti_naladeni() {
+        // Rádio má chybu -12 ppm: nosnou vidí o 12 ppm výš, než doopravdy je.
+        let ppm_skutecne = -12.0;
+        let nominal = 9_996_000.0f64;
+
+        // Zkusíme se naladit přesně, o 30 Hz níž i o 80 Hz výš.
+        for odchylka_ladeni in [0.0f64, -30.0, 80.0] {
+            let dial = nominal + odchylka_ladeni;
+            // Kde se nosná objeví na stupnici a jaký z toho bude tón.
+            let nosna_na_stupnici = nominal - dial * ppm_skutecne * 1e-6;
+            let ton = dsp::CW_PITCH_HZ + (nosna_na_stupnici - dial);
+
+            let zmereno = ppm_z_normalu(dial, nominal, ton);
+            assert!(
+                (zmereno - ppm_skutecne).abs() < 0.01,
+                "naladěno o {odchylka_ladeni} Hz vedle: vyšlo {zmereno:+.3} ppm, \
+                 čekáno {ppm_skutecne:+.3} ppm"
+            );
+        }
+    }
+
+    /// Znaménko: nosná pod nominálem znamená, že rádio ladí vysoko.
+    #[test]
+    fn kalibrace_ma_spravne_znamenko() {
+        let nominal = 10_000_000.0;
+        // Tón nižší než pitch = nosná leží pod naladěním = rádio ladí výš.
+        let vyssi = ppm_z_normalu(nominal, nominal, dsp::CW_PITCH_HZ - 100.0);
+        assert!(vyssi > 0.0, "mělo vyjít kladné, vyšlo {vyssi}");
+        assert!((vyssi - 10.0).abs() < 0.01, "100 Hz na 10 MHz = 10 ppm, vyšlo {vyssi}");
+
+        let nizsi = ppm_z_normalu(nominal, nominal, dsp::CW_PITCH_HZ + 100.0);
+        assert!((nizsi + 10.0).abs() < 0.01, "mělo být -10 ppm, vyšlo {nizsi}");
     }
 
     /// Čára squelche musí ležet nad šumem přesně o práh plus přepočet

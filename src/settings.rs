@@ -51,6 +51,10 @@ pub struct Settings {
     /// Vzorkovačka RSP1 v Hz - určuje šířku panoramatu i zátěž. Musí být
     /// z `source::RSP1_RATES_HZ`, jinak by decimace nevyšla celočíselně.
     pub rsp1_rate_hz: f64,
+    /// Odchylka krystalu RSP1 v ppm. Jedna hodnota platí pro celý rozsah -
+    /// vzorkovačka i oscilátor jedou z téhož krystalu, takže je chyba
+    /// relativní. Dá se změřit ze stereo pilotu na VKV (viz `dsp::pilot_ppm`).
+    pub rsp1_ppm: f64,
     /// Zvukovka s I/Q ze SoftRocku. Na ALSA třeba "hw:CARD=HD,DEV=0",
     /// u cpalu jméno zařízení nebo prázdno pro výchozí.
     pub capture_device: String,
@@ -116,6 +120,7 @@ impl Default for Settings {
             hardware: Hardware::SoftRock,
             rsp1_gain_db: RSP1_DEFAULT_GAIN_DB,
             rsp1_rate_hz: crate::source::RSP1_DEFAULT_RATE_HZ,
+            rsp1_ppm: 0.0,
             capture_device: audio::default_capture_device(),
             playback_device: audio::default_playback_device(),
             depth: Depth::Auto,
@@ -332,6 +337,7 @@ mod tests {
             hardware: Hardware::Rsp1,
             rsp1_gain_db: 4.5,
             rsp1_rate_hz: 1_920_000.0,
+            rsp1_ppm: -2.5,
             capture_device: "hw:CARD=HD,DEV=0".into(),
             playback_device: "pulse".into(),
             depth: Depth::Bits16,

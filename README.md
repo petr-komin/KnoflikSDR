@@ -6,7 +6,7 @@
 
 SDR přijímač psaný v Rustu pro **SoftRock** (I/Q ze zvukové karty, ladění Si570 přes USB
 protokolem DG8SAQ) a **SDRplay RSP1** (přes SoapySDR). K tomu panorama, vodopád
-a demodulace AM/USB/LSB.
+a demodulace AM/USB/LSB/CW, na RSP1 i WFM se stereem a RDS a NFM na 2 m/70 cm.
 
 Vznikl jako náhrada Quisku pro ty SoftRocky, které berou I/Q ze zvukovky — s cílem mít
 jeden statický binár místo Pythonu s C rozšířením.
@@ -22,13 +22,25 @@ jeden statický binár místo Pythonu s C rozšířením.
 - **Ruční notch** — úzká zádrž na heterodynní pískot, běží před AGC a značí se ve spektru
 - **Skenování** — projíždí oblíbené nebo viditelný výřez a zastaví, když signál otevře bránu
 - **Nahrávání do WAV** — 48 kHz, 16 bit; ukládá se před hlasitostí, tak ji knoflík neovlivní
-- **WFM stereo a RDS** — pilot 19 kHz pustí dvoukanálový zvuk, z 57 kHz se čte název
-  stanice a RadioText; šířka mezifrekvenční propusti (120–230 kHz) jde přiškrtit,
-  když sousední stanice přebíjí
+- **WFM stereo a plnohodnotné RDS** — z pilotu 19 kHz se fázovým závěsem odvodí podnosná
+  38 kHz i nosná RDS na 57 kHz. Dekodér zvládá koherentní demodulaci s dohledáním fáze,
+  obnovu bitového taktu a synchronizaci bloků přes syndromy s offsetovými slovy, takže
+  ukáže **název stanice, RadioText i PI kód** přímo z éteru. Šířka mezifrekvenční
+  propusti (120–230 kHz) jde přiškrtit, když sousední stanice přebíjí
+- **Kalibrace stupnice RSP1 bez měřicí techniky** — krystal se u každého kusu liší
+  a chyba roste s frekvencí: 12 ppm je na krátkých vlnách pár desítek hertzů, ale na
+  70 cm už **5,5 kHz**, tedy skoro půl kanálu. Kalibruje se proti normálu (RWM 9996 kHz,
+  WWV/BPM 10 MHz) měřením kmitočtu tónu v CW s přesností kolem 0,1 Hz — a protože se
+  počítá proti skutečnému naladění, nemusíš normál trefit na hertz. Jedna hodnota v ppm
+  platí pro KV i VKV, protože vzorkovačka i oscilátor jedou z téhož krystalu.
+  Orientačně se dá odchylka odečíst i ze stereo pilotu na VKV
 - **Bandplan i pro VKV/UHF** — s RSP1 se ladí souvisle do 2 GHz; vyznačená amatérská pásma
   6 m / 2 m / 70 cm / 23 cm, FM rozhlas i orientační DAB/DVB-T
 - **Velké skoky ladění** — na RSP1 tlačítka ±10 k / ±100 k / ±1 M kHz, na SoftRocku jemná
 - **Ladění kliknutím** do spektra i vodopádu, tažením hran se mění šířka pásma
+- **Přímé zadání frekvence** — naladěná hodnota se dá rovnou přepsat, takže se na normál
+  nebo převáděč trefíš přesně, ne po krocích
+- **Zoom se soustředí na naladěnou stanici**, takže se přibližuje to, co posloucháš
 - **Oblíbené stanice** — jedním klikem i s režimem a šířkou filtru
 - **Kdo to vlastně vysílá** — v AM se podle rozpisu EiBi ukáže, která stanice
   má na naladěné frekvenci právě teď být
@@ -36,7 +48,7 @@ jeden statický binár místo Pythonu s C rozšířením.
 - **Doladění na nejsilnější stanici** po skoku o celé okno
 - **Dvě rádia** — SoftRock i SDRplay RSP1, přepínají se **za běhu** selectem v liště
 - **Volitelná vzorkovačka RSP1** — od 1,344 MHz (užší, lehčí) po 6 MHz, vždy s celočíselnou decimací
-- **Nastavení v okně** — zvuková zařízení, bitová hloubka, zisk i kalibrace Si570
+- **Nastavení v okně** — zvuková zařízení, bitová hloubka, zisk, kalibrace Si570 i ppm RSP1
 - Nastavení se ukládá průběžně do `~/.config/knoflik-sdr/config.toml`
 
 ## Hardware
@@ -83,10 +95,35 @@ Přepnutí rádia, vzorkovačky i zisku se projeví **hned**. Změna vstupní zv
 Si570 se v okně potvrdí tlačítkem **↻ Použít změny** (taky bez restartu). Jen výstupní zařízení
 se mění restartem.
 
-Krystal je potřeba zkalibrovat pro každý kus zvlášť. Hodnotu můžeš převzít z `~/.quisk_conf.py`,
-pokud jsi předtím jel na Quisku.
+Krystal Si570 je potřeba zkalibrovat pro každý kus zvlášť. Hodnotu můžeš převzít
+z `~/.quisk_conf.py`, pokud jsi předtím jel na Quisku.
 
 USB práva řeší na Debianu udev pravidlo z `libhamlib4`, root potřeba není.
+
+### Kalibrace RSP1
+
+Krystal RSP1 má taky svou odchylku a stojí za to ji srovnat: chyba je relativní, takže
+na 10 MHz jde o desítky hertzů, ale na 70 cm už o kilohertze — dost na to, aby se
+nedařilo trefit převáděč.
+
+Vzorkovačka i směšovací oscilátor jedou z **jednoho krystalu**, takže jedna hodnota
+v ppm platí pro celý rozsah.
+
+1. Přepni na **CW**, šířku dej ~2 kHz a vypni squelch.
+2. Do pole **naladěno** napiš frekvenci normálu, třeba `9996` (RWM, Moskva, rubidium —
+   pozná se podle střídání nosné, pulzů a značky `RWM` morseovkou). Dál jsou
+   WWV a BPM na 10 MHz. Čím vyšší kmitočet, tím lépe je odchylka vidět.
+3. **⚙ nastavení → SDRplay RSP1 → podle normálu (v CW)**: zadej tutéž frekvenci
+   a klikni **změřit**. Měř během klidné nosné, ne během pulzů.
+4. Zkontroluj výsledek a dej **použít**. Pak změř znovu — má vyjít blízko nule.
+
+Měření bere 0,68 s zvuku a proloží špičku parabolou, takže trefí kmitočet tónu asi na
+0,1 Hz; na 10 MHz to odpovídá 0,01 ppm. Počítá se proti **skutečnému naladění**, ne proti
+nominálu, takže nemusíš normál trefit na hertz přesně.
+
+Rychlá orientační kontrola je i na VKV: u stereo stanice se v nastavení ukáže odchylka
+změřená ze **stereo pilotu 19 kHz**. Norma mu ale povoluje ±2 Hz (±105 ppm), takže se na
+jednu stanici nespoléhej — buď to ověř na několika, nebo použij normál na KV.
 
 ## Přenositelnost
 
@@ -131,7 +168,14 @@ Poznámky k dalším směrům:
 - [docs/raspberry-pi.md](docs/raspberry-pi.md) — provoz SoftRocku na Pi.
   DSP zabere ~8 % jádra i9, takže by to mělo stačit; úzkým hrdlem bude spíš
   vodopád než procesor.
-- [docs/sdrplay-rsp1.md](docs/sdrplay-rsp1.md) — SDRplay RSP1: řetězec jede
-  a panorama ukazuje signál, ale **jestli to pořádně zní, zatím nikdo
-  neposoudil**. Otevřené je řízení zisku (přes SoapyMiri jen LNA 0–10,2 dB)
-  a IF filtry tuneru.
+- [docs/sdrplay-rsp1.md](docs/sdrplay-rsp1.md) — SDRplay RSP1: WFM se stereem
+  a RDS je odposlechnuté v éteru, stupnice se dá zkalibrovat proti normálu.
+  Otevřené zůstává řízení zisku (přes SoapyMiri jen LNA 0–10,2 dB) a IF filtry
+  tuneru.
+- **Ztráta vzorků na vysokých vzorkovačkách.** Na 4,8 a 6 MSps hlásí libmirisdr
+  „samples lost" — je to strop USB 2.0, ne chyba programu. Pomáhá zapojit RSP1
+  do portu, který nevisí za interním hubem. Bulk přenosy (které by se opakovaly
+  místo zahazování) SoapyMiri zvolit neumí; šlo by to jen obejitím SoapySDR
+  a voláním libmirisdr napřímo.
+- **ppm kalibrace se ukládá jen pro RSP1.** SoftRock má vlastní cestu přes
+  krystal Si570.

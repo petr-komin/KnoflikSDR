@@ -54,6 +54,7 @@ pub fn open(set: &Settings) -> Result<(Box<dyn Source>, Box<dyn Tuner>)> {
         // Klon, ne nové otevření - viz poznámka 2 v hlavičce.
         dev: dev.clone(),
         label: label_of(&dev),
+        ppm: set.rsp1_ppm,
     };
     Ok((Box::new(Rsp1Source { stream, rate }), Box::new(tuner)))
 }
@@ -93,12 +94,18 @@ impl Source for Rsp1Source {
 struct Rsp1Tuner {
     dev: Device,
     label: String,
+    /// Odchylka krystalu v ppm. Ladíme o ni zpátky, takže na stupnici sedí
+    /// skutečný kmitočet. Jedna hodnota platí pro KV i VKV - chyba je
+    /// relativní, protože vzorkovačka i oscilátor jedou z jednoho krystalu.
+    ppm: f64,
 }
 
 impl Tuner for Rsp1Tuner {
     fn set_center(&mut self, hz: f64) -> Result<()> {
+        // Rádio ladí o `ppm` vedle, tak si o tolik řekneme na druhou stranu.
+        let zadano = hz / (1.0 + self.ppm * 1e-6);
         self.dev
-            .set_frequency(Direction::Rx, 0, hz, ())
+            .set_frequency(Direction::Rx, 0, zadano, ())
             .map_err(|e| anyhow!("RSP1: ladění na {hz} Hz selhalo: {e}"))
     }
 

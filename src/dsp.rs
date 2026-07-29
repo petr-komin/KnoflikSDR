@@ -1141,6 +1141,28 @@ impl Demod {
         self.mode.is_wfm() && self.wfm.pilot_locked
     }
 
+    /// Odchylka vzorkovacích hodin v ppm, změřená na stereo pilotu.
+    ///
+    /// Pilot je přesně 19 000 Hz z normálu vysílače. Měříme ho ale až za
+    /// demodulací, takže jeho zdánlivá odchylka nezávisí na směšovacím
+    /// oscilátoru - jen na tom, jak rychle doopravdy vzorkujeme. A protože
+    /// RSP1 odvozuje vzorkovačku i oscilátor z jednoho krystalu, je to rovnou
+    /// relativní chyba celého rádia. Platí tedy stejně na KV i na VKV.
+    ///
+    /// Vrací `None`, dokud závěs pilot nedrží - jinak by to bylo měření šumu.
+    pub fn pilot_ppm(&self) -> Option<f64> {
+        if !self.pilot_locked() {
+            return None;
+        }
+        let f = self.wfm.pll.freq as f64;
+        if f.abs() < 1e-9 {
+            return None;
+        }
+        // freq je fáze na vzorek při skutečné vzorkovačce, nominal při
+        // předpokládané; jejich poměr je přímo (1 + chyba).
+        Some((self.wfm.pll.nominal as f64 / f - 1.0) * 1e6)
+    }
+
     /// Naměřená úroveň pilotu - přímo ta veličina, která se porovnává
     /// s [`FM_PILOT_LOCK`], ať jde číslo v GUI číst proti prahu.
     ///
@@ -1158,6 +1180,12 @@ impl Demod {
     /// Kolik datových bloků RDS prošlo kontrolou a kolik ne.
     pub fn rds_blocks(&self) -> (u32, u32) {
         self.wfm.rds.block_stats()
+    }
+
+    /// Zapomene, co se přečetlo z RDS. Po přeladění na jinou stanici je
+    /// starý název i text neplatný.
+    pub fn reset_rds(&mut self) {
+        self.wfm.rds.reset();
     }
 
     /// Otevření oka RDS a kolikrát se chytala synchronizace - pro diagnostiku.
@@ -1714,6 +1742,46 @@ mod wfm_tests {
             "KNOFLIK",
             "název se nepřečetl vedle silného sterea - bloků prošlo {ok}, neprošlo {spatne}"
         );
+    }
+
+    /// Měření odchylky krystalu z pilotu musí vyjít i ve znaménku.
+    ///
+    /// Když jdou hodiny rychleji, jeví se pilot **níž** než 19 kHz - a měření
+    /// z toho musí udělat kladnou odchylku. Znaménko je přesně to, co se dá
+    /// snadno obrátit a co by pak stupnici místo srovnání rozhodilo na
+    /// dvojnásobek chyby.
+    #[test]
+    fn zmereni_ppm_z_pilotu_ma_spravne_znamenko() {
+        let in_rate = 1_344_000.0;
+        let decim = 28;
+        // Hodiny o 20 ppm rychlejší: skutečný pilot 19 kHz se ve vzorcích
+        // jeví jako 19000/(1+20e-6).
+        for cekano_ppm in [20.0f64, -35.0] {
+            let mut wfm = WfmDemod::new(in_rate, decim);
+            let mut sq = Squelch::new(48_000.0);
+            let pilot_hz = FM_PILOT_HZ / (1.0 + cekano_ppm * 1e-6);
+
+            let mut out = Vec::new();
+            let mut ph = 0.0f64;
+            for n in 0..(48_000 * decim) {
+                let t = n as f64 / in_rate;
+                let mpx = 0.09 * (2.0 * PI * pilot_hz * t).cos();
+                ph += 2.0 * PI * (FM_DEVIATION_HZ * mpx) / in_rate;
+                wfm.process(
+                    Complex32::new(ph.cos() as f32, ph.sin() as f32),
+                    &mut out,
+                    &mut sq,
+                );
+            }
+
+            assert!(wfm.pilot_locked, "závěs se nechytil");
+            let f = wfm.pll.freq as f64;
+            let zmereno = (wfm.pll.nominal as f64 / f - 1.0) * 1e6;
+            assert!(
+                (zmereno - cekano_ppm).abs() < 3.0,
+                "naměřeno {zmereno:+.1} ppm, čekáno {cekano_ppm:+.1} ppm"
+            );
+        }
     }
 
     /// Bez pilotu se nesmí pustit stereo - jinak by se z šumu kolem 38 kHz
