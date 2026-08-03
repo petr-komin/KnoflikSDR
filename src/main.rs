@@ -24,6 +24,13 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 const WF_HEIGHT: usize = 256;
+/// Barva mřížky v panoramatu.
+///
+/// Poloprůhledná bílá, ne tmavá šedá: mřížka se kreslí až přes podbarvení
+/// bandplanu, a tmavá čára na obarveném pozadí splyne. Bílá s nízkou
+/// průhledností je vidět nad prázdným spektrem i nad barevným úsekem.
+const GRID: egui::Color32 = egui::Color32::from_rgba_premultiplied(60, 60, 60, 60);
+
 /// Výška pruhu s frekvenční osou pod spektrem.
 const AXIS_H: f32 = 16.0;
 /// Mrtvá zóna kolem VFO (= DC). SoftRock tu má spur a nevyvážení I/Q,
@@ -642,6 +649,382 @@ impl App {
             None
         };
         c.stereo = self.set.stereo;
+    }
+
+    /// Skupina "ladění": VFO, skoky, přímé zadání frekvence a co je naladěno.
+    fn grp_ladeni(&mut self, ui: &mut egui::Ui, span_hz: f64, tuned_khz: f64) {
+        ui.horizontal(|ui| {
+            // Naladěná frekvence je to nejdůležitější číslo na obrazovce,
+            // proto velkým písmem a jako první. Jde přímo přepsat: ladit jen
+            // kolečkem nestačí, na normál nebo převáděč se člověk musí trefit
+            // přesně, a naladěno = VFO + offset, takže zadání VFO to neumí.
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.tuned_input)
+                    .desired_width(110.0)
+                    .font(egui::TextStyle::Heading),
+            );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if let Ok(v) = self.tuned_input.trim().replace(',', ".").parse::<f64>() {
+                    let bw = self.bandwidth_hz();
+                    self.tune_to(v, self.set.mode, bw);
+                }
+            }
+            if !resp.has_focus() {
+                self.tuned_input = format!("{tuned_khz:.3}");
+            }
+            ui.label(egui::RichText::new("kHz").size(16.0).strong());
+        });
+        ui.horizontal(|ui| {
+            ui.label("VFO:");
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.vfo_input).desired_width(80.0));
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if let Ok(v) = self.vfo_input.trim().replace(',', ".").parse::<f64>() {
+                    self.set_vfo(v);
+                    self.center_view_on_tuned();
+                }
+            }
+            let roh = format!(
+                "posun o celé okno ({:.0} kHz) a doladění na nejsilnější stanici",
+                span_hz / 1000.0
+            );
+            if ui.button("◀◀").on_hover_text(&roh).clicked() {
+                self.jump_window(span_hz, -1.0);
+            }
+            for &d in self.vfo_steps_khz() {
+                // Velké skoky ukazuj v MHz, ať tlačítko není "+1000 k".
+                let label = if d.abs() >= 1000.0 {
+                    format!("{:+.0}M", d / 1000.0)
+                } else {
+                    format!("{d:+.0}k")
+                };
+                if ui
+                    .button(label)
+                    .on_hover_text("posune okno, naladěná stanice zůstane")
+                    .clicked()
+                {
+                    self.step_vfo(d, span_hz);
+                }
+            }
+            if ui.button("▶▶").on_hover_text(&roh).clicked() {
+                self.jump_window(span_hz, 1.0);
+            }
+        });
+    }
+
+    /// Skupina "stanice": co je na naladěné frekvenci - úsek pásma z bandplanu
+    /// a u VKV rozhlasu název z RDS.
+    fn grp_stanice(&mut self, ui: &mut egui::Ui, tuned_khz: f64) {
+        // Pevná šířka: obsah se mění (název stanice, stav RDS, úsek pásma)
+        // a bez ní by se skupina roztahovala a smršťovala podle textu.
+        ui.set_min_width(230.0);
+        ui.set_max_width(230.0);
+        // Název stanice z RDS je totéž, co u AM ukazuje rozpis EiBi,
+        // jen přímo z éteru.
+        //
+        // Ukazuje se i když se ještě nic nepřečetlo: jinak by nebylo poznat,
+        // jestli stanice RDS nevysílá, nebo je jen slabá - a hlavně by
+        // uživatel nevěděl, kam se vůbec dívat.
+        if self.set.mode.is_wfm() {
+            let rds = self.shared.rds.lock().unwrap().clone();
+            let stereo = self.shared.stereo_active.load(Ordering::Relaxed);
+            // Pozor: pilot ≠ stereo. Stereo se dá vypnout přepínačem,
+            // ale RDS na pilotu stojí pořád - proto se ptáme na pilot.
+            let pilot = self.shared.pilot_locked.load(Ordering::Relaxed);
+            let pilot_lvl = f32::from_bits(self.shared.pilot_level.load(Ordering::Relaxed));
+            ui.horizontal(|ui| {
+                if !rds.ps.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&rds.ps)
+                            .size(16.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(120, 200, 255)),
+                    )
+                    .on_hover_text(match rds.pi {
+                        Some(pi) => format!("název stanice z RDS (PI {pi:04X})"),
+                        None => "název stanice z RDS".to_string(),
+                    });
+                } else {
+                    // Pilot je předpoklad RDS - když není, nemá cenu čekat.
+                    // Součástí hlášky je naměřená úroveň pilotu: bez ní by
+                    // nebylo poznat, jestli pilot chybí, nebo jen těsně
+                    // nedosáhl na práh.
+                    // Text musí být ustálený. Počty bloků i úroveň pilotu se
+                    // mění každý snímek, a kdyby byly přímo v hlášce, blikalo
+                    // by to - obzvlášť na prázdném kanálu, kde se nic nechytá.
+                    // Čísla proto patří do tooltipu, kde je čteš, až když chceš.
+                    let (text, tip) = if pilot {
+                        let ok = self.shared.rds_good.load(Ordering::Relaxed);
+                        let bad = self.shared.rds_bad.load(Ordering::Relaxed);
+                        (
+                            "RDS: hledám…",
+                            format!(
+                                "pilot je chycený, čekám na datové bloky\n\
+                                 bloků prošlo {ok}, neprošlo {bad}\n\
+                                 když neprojde nic, je chyba v demodulaci nebo taktu"
+                            ),
+                        )
+                    } else {
+                        (
+                            "RDS: bez pilotu",
+                            format!(
+                                "pilot 19 kHz nedosáhl na práh {:.3} - naměřeno {pilot_lvl:.4}\n\
+                                 bez pilotu se nedá odvodit nosná 57 kHz, na které RDS jede",
+                                dsp::FM_PILOT_LOCK
+                            ),
+                        )
+                    };
+                    ui.label(egui::RichText::new(text).weak()).on_hover_text(tip);
+                }
+                if stereo {
+                    ui.label(
+                        egui::RichText::new("◉ stereo")
+                            .color(egui::Color32::from_rgb(80, 200, 90))
+                            .strong(),
+                    )
+                    .on_hover_text("pilot 19 kHz je slyšet, hraje se dvoukanálově");
+                }
+            });
+        }
+        // V jakém úseku pásma zrovna jsme.
+        match bandplan::at(tuned_khz) {
+            Some(s) => {
+                let (r, g, b) = s.usage.color();
+                ui.label(
+                    egui::RichText::new(format!("{} · {}", s.band, s.usage.label()))
+                        .color(egui::Color32::from_rgb(r, g, b)),
+                );
+            }
+            None => {
+                ui.label(egui::RichText::new("mimo vyznačená pásma").weak());
+            }
+        }
+    }
+
+    /// Skupina "režim": druh provozu a šířka filtru. Patří k sobě - šířka
+    /// se pamatuje pro každý režim zvlášť a jeho volbou se mění.
+    fn grp_rezim(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for m in [
+                dsp::Mode::Am,
+                dsp::Mode::Usb,
+                dsp::Mode::Lsb,
+                dsp::Mode::Cw,
+                dsp::Mode::Nfm,
+                dsp::Mode::Wfm,
+            ] {
+                // WFM má smysl jen na širokopásmovém vstupu (RSP1); na
+                // krátkovlnném SoftRocku by z 96 kHz FM nešla, tak ho zašedni.
+                let ok = !m.is_wfm() || self.set.hardware == source::Hardware::Rsp1;
+                let resp = ui
+                    .add_enabled_ui(ok, |ui| ui.selectable_value(&mut self.set.mode, m, m.label()))
+                    .inner;
+                if m.is_wfm() && !ok {
+                    resp.on_hover_text("WFM potřebuje širokopásmové rádio (RSP1)");
+                }
+            }
+        });
+        let (bw_min, bw_max) = radio::bandwidth_range(self.set.mode);
+        let mut bw_khz = self.bandwidth_hz() / 1000.0;
+        // U WFM jsou to stovky kHz, tam desetiny nedávají smysl.
+        let wfm = self.set.mode.is_wfm();
+        let resp = ui.add(
+            egui::Slider::new(&mut bw_khz, bw_min / 1000.0..=bw_max / 1000.0)
+                .text("šířka [kHz]")
+                .fixed_decimals(if wfm { 0 } else { 1 }),
+        );
+        if resp.changed() {
+            self.set_bandwidth_hz(bw_khz * 1000.0);
+        }
+        if wfm {
+            resp.on_hover_text(
+                "šířka mezifrekvenční propusti\n\
+                 úžeji = odolnější proti sousední stanici, ale zkreslenější zvuk",
+            );
+        }
+    }
+
+    /// Skupina "signál": jak silný je a odkdy se pustí do sluchátek.
+    /// S-metr a práh brány jsou ve stejné stupnici (dBFS), tak patří k sobě.
+    fn grp_signal(&mut self, ui: &mut egui::Ui) {
+        self.s_meter(ui);
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.set.squelch_on, "squelch").on_hover_text(
+                "umlčí zvuk, když signál klesne pod práh - ať mezi stanicemi nesyčí",
+            );
+            ui.add_enabled_ui(self.set.squelch_on, |ui| {
+                ui.add(
+                    egui::Slider::new(
+                        &mut self.set.squelch_db,
+                        radio::SQUELCH_MIN_DB..=radio::SQUELCH_MAX_DB,
+                    )
+                    .fixed_decimals(0)
+                    .suffix(" dBFS"),
+                )
+                .on_hover_text(
+                    "práh brány (oranžová čára v panoramatu) - výš = otevře jen silnější signál",
+                );
+            });
+        });
+    }
+
+    /// Skupina "zvuk": co se děje se zvukem cestou do sluchátek.
+    fn grp_zvuk(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("hlasitost:");
+            ui.add(egui::Slider::new(&mut self.set.volume, 0.0..=1.0).show_value(false));
+        });
+        ui.horizontal(|ui| self.agc_controls(ui));
+        ui.horizontal(|ui| {
+            self.notch_controls(ui);
+            // Stereo jen ve WFM - jinde by přepínač nic nedělal.
+            if self.set.mode.is_wfm() {
+                self.wfm_controls(ui);
+            }
+        });
+    }
+
+    /// Skupina "zobrazení": jak vypadá panorama. S příjmem to nesouvisí,
+    /// tak ať to nepřekáží mezi ovládáním rádia.
+    fn grp_zobrazeni(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("zoom:");
+            if ui.button("−").clicked() {
+                self.set_zoom(self.set.zoom / 2.0);
+            }
+            ui.label(format!("{:.0}×", self.set.zoom));
+            if ui.button("+").clicked() {
+                self.set_zoom(self.set.zoom * 2.0);
+            }
+            if ui
+                .button("celé")
+                .on_hover_text("oddálit na celou vzorkovačku (nebo Ctrl+kolečko)")
+                .clicked()
+            {
+                self.set_zoom(1.0);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("dB:");
+            // Rozsah se drží pro každé rádio zvlášť, tak se čte i zapisuje
+            // přes přístupové metody podle právě zvoleného hardwaru.
+            let (mut lo, mut hi) = self.set.db_range();
+            let a = ui.add(egui::Slider::new(&mut lo, -140.0..=-40.0).text("min"));
+            let b = ui.add(egui::Slider::new(&mut hi, -60.0..=0.0).text("max"));
+            if a.changed() || b.changed() {
+                self.set.set_db_range(lo, hi);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.set.show_bandplan, "bandplan")
+                .on_hover_text("podbarvení úseků pásem (IARU R1)");
+            ui.checkbox(&mut self.set.show_console, "konzole")
+                .on_hover_text("dekódovaný text z RTTY a CW");
+        });
+    }
+
+    /// Skupina "rádio": které je připojené a jak je nastavené.
+    fn grp_radio(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            // Přepínač rádia - přepne se hned za běhu, bez restartu.
+            let mut switch_hw = None;
+            egui::ComboBox::from_id_salt("hw_top")
+                .selected_text(self.set.hardware.label())
+                .show_ui(ui, |ui| {
+                    for hw in source::Hardware::ALL {
+                        let vybrano = self.set.hardware == hw;
+                        if hw.available() {
+                            if ui.selectable_label(vybrano, hw.label()).clicked() && !vybrano {
+                                switch_hw = Some(hw);
+                            }
+                        } else {
+                            ui.add_enabled_ui(false, |ui| {
+                                let _ = ui.selectable_label(vybrano, hw.label());
+                            })
+                            .response
+                            .on_hover_text("není v tomhle sestavení - chce Linux a feature `rsp1`");
+                        }
+                    }
+                });
+            if let Some(hw) = switch_hw {
+                self.set.hardware = hw;
+                // Nové rádio má jiný rozsah - přeladit do něj, ať SoftRock
+                // nezůstane viset na kmitočtu, kam dosáhne jen RSP1.
+                self.set_vfo(self.set.vfo_khz);
+                // SoftRock WFM neumí - přepni na AM, ať nezní šum z prázdné FM.
+                if self.set.mode.is_wfm() && hw != source::Hardware::Rsp1 {
+                    self.set.mode = dsp::Mode::Am;
+                }
+                self.request_reopen();
+            }
+            if ui
+                .button("⚙ nastavení")
+                .on_hover_text("zvuková zařízení, bitová hloubka, Si570, kalibrace")
+                .clicked()
+            {
+                self.show_options = !self.show_options;
+            }
+        });
+
+        // Ovládání specifické pro RSP1 patří na panel, ne do nastavení -
+        // zisk se ladí za poslechu, vzorkovačka mění šířku panoramatu.
+        if self.set.hardware == source::Hardware::Rsp1 {
+            if let Some(g) = *self.shared.gain_range.lock().unwrap() {
+                ui.horizontal(|ui| {
+                    ui.label("zisk:");
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut self.set.rsp1_gain_db, g.min..=g.max)
+                                .fixed_decimals(1)
+                                .suffix(" dB"),
+                        )
+                        .on_hover_text("zesílení LNA - projeví se hned")
+                        .changed()
+                    {
+                        let _ = self.gain_tx.send(self.set.rsp1_gain_db);
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                let puvodni = self.set.rsp1_rate_hz;
+                egui::ComboBox::from_id_salt("rsp1_rate_top")
+                    .selected_text(format!("{:.3} MHz", puvodni / 1e6))
+                    .show_ui(ui, |ui| {
+                        for &r in source::RSP1_RATES_HZ {
+                            ui.selectable_value(
+                                &mut self.set.rsp1_rate_hz,
+                                r,
+                                format!("{:.3} MHz · panorama {:.0} kHz", r / 1e6, r / 1000.0),
+                            );
+                        }
+                    });
+                if self.set.rsp1_rate_hz != puvodni {
+                    self.request_reopen();
+                }
+                ui.checkbox(&mut self.set.swap_iq, "prohodit I/Q");
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.set.swap_iq, "prohodit I/Q");
+            });
+        }
+    }
+
+    /// Skupina "akce": co se dá spustit. Samá tlačítka, ne nastavení -
+    /// proto zvlášť.
+    fn grp_akce(&mut self, ui: &mut egui::Ui, bins: &[f32], span_hz: f64) {
+        ui.horizontal(|ui| {
+            if ui
+                .button("⌖ nejsilnější")
+                .on_hover_text("doladit na nejsilnější stanici v okně")
+                .clicked()
+            {
+                self.snap_to_strongest(bins, span_hz);
+            }
+            ui.separator();
+            self.record_controls(ui);
+            ui.separator();
+            self.scan_controls(ui, span_hz);
+        });
     }
 
     /// Kalibrace stupnice RSP1.
@@ -1855,7 +2238,8 @@ impl App {
         self.wf_pixels
             .copy_within(0..(WF_HEIGHT - 1) * row_bytes, row_bytes);
         for (i, &db) in bins.iter().enumerate() {
-            let t = ((db - self.set.db_min) / (self.set.db_max - self.set.db_min)).clamp(0.0, 1.0);
+            let (db_lo, db_hi) = self.set.db_range();
+            let t = ((db - db_lo) / (db_hi - db_lo)).clamp(0.0, 1.0);
             let [r, g, b] = colormap(t);
             let p = i * 4;
             self.wf_pixels[p] = r;
@@ -1879,6 +2263,28 @@ impl App {
 fn ppm_z_normalu(dial_hz: f64, nominal_hz: f64, ton_hz: f64) -> f64 {
     let nosna_hz = dial_hz + (ton_hz - dsp::CW_PITCH_HZ);
     (nominal_hz - nosna_hz) / dial_hz * 1e6
+}
+
+/// Orámovaná skupina ovládacích prvků se štítkem.
+///
+/// Ovládání je toho hodně a všechno je potřeba, takže se nedá schovávat.
+/// Bez vizuálních kotev ale vznikne jednolitá změť, ve které oko nemá čeho
+/// se chytit - proto rámeček a nadpis. Hledá se pak podle názvu skupiny
+/// místo podle tvaru tlačítka.
+fn skupina<R>(ui: &mut egui::Ui, nadpis: &str, obsah: impl FnOnce(&mut egui::Ui) -> R) {
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::symmetric(6, 3))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(nadpis)
+                        .small()
+                        .weak()
+                        .text_style(egui::TextStyle::Small),
+                );
+                obsah(ui);
+            });
+        });
 }
 
 /// Ořízne text na danou délku a přidá výpustku. Řez padne na hranici znaku,
@@ -2106,350 +2512,26 @@ impl eframe::App for App {
 
         egui::Panel::top("ovladani").show(ui, |ui| {
             ui.add_space(4.0);
-            // Zalamovací: do téhle řádky se vešlo ladění, režimy, S-metr,
-            // squelch i název stanice z RDS. Bez zalamování se to při užším
-            // okně uřízne vpravo a co nepasuje, není vidět vůbec.
+            // Ovládání je rozdělené do orámovaných skupin se štítky. Nic se
+            // neschovává - všechno je potřeba a doklikávat se k tomu by
+            // zdržovalo - ale bez vizuálních kotev vznikne jednolitá změť,
+            // ve které se blbě hledá. Skupiny se při užším okně zalomí.
             ui.horizontal_wrapped(|ui| {
-                ui.label("VFO [kHz]:");
-                let resp =
-                    ui.add(egui::TextEdit::singleline(&mut self.vfo_input).desired_width(90.0));
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    if let Ok(v) = self.vfo_input.trim().replace(',', ".").parse::<f64>() {
-                        self.set_vfo(v);
-                        self.center_view_on_tuned();
-                    }
-                }
-                if ui
-                    .button("◀ za roh")
-                    .on_hover_text(format!(
-                        "posun o celé okno ({:.0} kHz) a doladění na nejsilnější stanici",
-                        span_hz / 1000.0
-                    ))
-                    .clicked()
-                {
-                    self.jump_window(span_hz, -1.0);
-                }
-                for &d in self.vfo_steps_khz() {
-                    // Velké skoky ukazuj v MHz, ať tlačítko není "+1000 k".
-                    let label = if d.abs() >= 1000.0 {
-                        format!("{:+.0} M", d / 1000.0)
-                    } else {
-                        format!("{d:+.0} k")
-                    };
-                    if ui
-                        .button(label)
-                        .on_hover_text("posune okno, naladěná stanice zůstane")
-                        .clicked()
-                    {
-                        self.step_vfo(d, span_hz);
-                    }
-                }
-                if ui
-                    .button("za roh ▶")
-                    .on_hover_text(format!(
-                        "posun o celé okno ({:.0} kHz) a doladění na nejsilnější stanici",
-                        span_hz / 1000.0
-                    ))
-                    .clicked()
-                {
-                    self.jump_window(span_hz, 1.0);
-                }
-                ui.separator();
-                // Naladěná frekvence jde přímo přepsat. Ladit jen kolečkem
-                // nestačí: na normál se člověk musí trefit přesně, ne po
-                // krocích, a naladěno = VFO + offset, takže to zadání VFO
-                // neumí.
-                ui.label(egui::RichText::new("naladěno").size(18.0).strong());
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.tuned_input)
-                        .desired_width(100.0)
-                        .font(egui::TextStyle::Heading),
-                );
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    if let Ok(v) = self.tuned_input.trim().replace(',', ".").parse::<f64>() {
-                        let bw = self.bandwidth_hz();
-                        self.tune_to(v, self.set.mode, bw);
-                    }
-                }
-                // Dokud v poli nepíšeš, ukazuje aktuální ladění.
-                if !resp.has_focus() {
-                    self.tuned_input = format!("{tuned_khz:.3}");
-                }
-                ui.label(egui::RichText::new("kHz").size(18.0).strong());
-                // Název stanice z RDS patří rovnou k naladěné frekvenci - je
-                // to totéž, co u AM ukazuje rozpis EiBi, jen přímo z éteru.
-                //
-                // Ukazuje se i když se ještě nic nepřečetlo: jinak by nebylo
-                // poznat, jestli stanice RDS nevysílá, nebo je jen slabá -
-                // a hlavně by uživatel nevěděl, kam se vůbec dívat.
-                if self.set.mode.is_wfm() {
-                    let rds = self.shared.rds.lock().unwrap().clone();
-                    let stereo = self.shared.stereo_active.load(Ordering::Relaxed);
-                    // Pozor: pilot ≠ stereo. Stereo se dá vypnout přepínačem,
-                    // ale RDS na pilotu stojí pořád - proto se ptáme na pilot.
-                    let pilot = self.shared.pilot_locked.load(Ordering::Relaxed);
-                    let pilot_lvl = f32::from_bits(
-                        self.shared.pilot_level.load(Ordering::Relaxed),
-                    );
-                    if !rds.ps.is_empty() {
-                        ui.label(
-                            egui::RichText::new(&rds.ps)
-                                .size(18.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(120, 200, 255)),
-                        )
-                        .on_hover_text(match rds.pi {
-                            Some(pi) => format!("název stanice z RDS (PI {pi:04X})"),
-                            None => "název stanice z RDS".to_string(),
-                        });
-                    } else {
-                        // Pilot je předpoklad RDS - když není, nemá cenu čekat.
-                        // Součástí hlášky je naměřená úroveň pilotu: bez ní by
-                        // nebylo poznat, jestli pilot chybí, nebo jen těsně
-                        // nedosáhl na práh.
-                        let (text, tip) = if pilot {
-                            // Počty bloků rovnou v hlášce: bez nich by nešlo
-                            // poznat, jestli demodulace nefunguje vůbec, nebo
-                            // jen občas propadne slabý signál.
-                            let ok = self.shared.rds_good.load(Ordering::Relaxed);
-                            let bad = self.shared.rds_bad.load(Ordering::Relaxed);
-                            (
-                                format!("RDS: hledám… ({ok}/{})", ok + bad),
-                                format!(
-                                    "pilot je chycený, čekám na datové bloky\n\
-                                     bloků prošlo {ok}, neprošlo {bad}\n\
-                                     když neprojde nic, je chyba v demodulaci nebo taktu"
-                                ),
-                            )
-                        } else {
-                            (
-                                format!("RDS: bez pilotu ({pilot_lvl:.3})"),
-                                format!(
-                                    "pilot 19 kHz nedosáhl na práh {:.3} - naměřeno {pilot_lvl:.4}\n\
-                                     bez pilotu se nedá odvodit nosná 57 kHz, na které RDS jede",
-                                    dsp::FM_PILOT_LOCK
-                                ),
-                            )
-                        };
-                        ui.label(egui::RichText::new(text).weak()).on_hover_text(tip);
-                    }
-                    if stereo {
-                        ui.label(
-                            egui::RichText::new("◉ stereo")
-                                .color(egui::Color32::from_rgb(80, 200, 90))
-                                .strong(),
-                        )
-                        .on_hover_text("pilot 19 kHz je slyšet, hraje se dvoukanálově");
-                    }
-                }
-                // V jakém úseku pásma zrovna jsme.
-                if let Some(s) = bandplan::at(tuned_khz) {
-                    let (r, g, b) = s.usage.color();
-                    ui.label(
-                        egui::RichText::new(format!("{} · {}", s.band, s.usage.label()))
-                            .color(egui::Color32::from_rgb(r, g, b)),
-                    );
-                }
-                ui.separator();
-                for m in [
-                    dsp::Mode::Am,
-                    dsp::Mode::Usb,
-                    dsp::Mode::Lsb,
-                    dsp::Mode::Cw,
-                    dsp::Mode::Nfm,
-                    dsp::Mode::Wfm,
-                ] {
-                    // WFM má smysl jen na širokopásmovém vstupu (RSP1); na
-                    // krátkovlnném SoftRocku by z 96 kHz FM nešla, tak ho zašedni.
-                    let ok = !m.is_wfm() || self.set.hardware == source::Hardware::Rsp1;
-                    let resp = ui
-                        .add_enabled_ui(ok, |ui| {
-                            ui.selectable_value(&mut self.set.mode, m, m.label())
-                        })
-                        .inner;
-                    if m.is_wfm() && !ok {
-                        resp.on_hover_text("WFM potřebuje širokopásmové rádio (RSP1)");
-                    }
-                }
-                ui.separator();
-                self.s_meter(ui);
-                // Šumová brána hned u S-metru - práh je ve stejné stupnici (dBFS),
-                // takže je vidět, kam vůči síle signálu čáru squelche stavíš.
-                ui.checkbox(&mut self.set.squelch_on, "squelch")
-                    .on_hover_text("umlčí zvuk, když signál klesne pod práh - ať mezi stanicemi nesyčí");
-                ui.add_enabled_ui(self.set.squelch_on, |ui| {
-                    ui.add(
-                        egui::Slider::new(
-                            &mut self.set.squelch_db,
-                            radio::SQUELCH_MIN_DB..=radio::SQUELCH_MAX_DB,
-                        )
-                        .fixed_decimals(0)
-                        .suffix(" dBFS"),
-                    )
-                    .on_hover_text("práh brány (oranžová čára v panoramatu) - výš = otevře jen silnější signál");
-                });
-                ui.separator();
-                if ui
-                    .button("⌖ nejsilnější")
-                    .on_hover_text("doladit na nejsilnější stanici v okně")
-                    .clicked()
-                {
-                    self.snap_to_strongest(&bins, span_hz);
-                }
+                skupina(ui, "ladění", |ui| self.grp_ladeni(ui, span_hz, tuned_khz));
+                skupina(ui, "režim", |ui| self.grp_rezim(ui));
+                skupina(ui, "signál", |ui| self.grp_signal(ui));
+                // Až na konci: obsah se mění podle toho, co je zrovna v éteru,
+                // takže kdyby stál dřív, posouval by při každé změně všechno
+                // za sebou. Šířku má navíc pevnou, ať sebou necuká ani sám.
+                skupina(ui, "stanice", |ui| self.grp_stanice(ui, tuned_khz));
             });
             ui.add_space(2.0);
-            // Zalamovací - na RSP1 sem přibude zisk a vzorkovačka, ať se to
-            // na užším okně přelije na druhý řádek místo useknutí.
             ui.horizontal_wrapped(|ui| {
-                // Přepínač rádia - přepne se hned za běhu, bez restartu.
-                ui.label("rádio:");
-                let mut switch_hw = None;
-                egui::ComboBox::from_id_salt("hw_top")
-                    .selected_text(self.set.hardware.label())
-                    .show_ui(ui, |ui| {
-                        for hw in source::Hardware::ALL {
-                            let vybrano = self.set.hardware == hw;
-                            if hw.available() {
-                                if ui.selectable_label(vybrano, hw.label()).clicked() && !vybrano {
-                                    switch_hw = Some(hw);
-                                }
-                            } else {
-                                ui.add_enabled_ui(false, |ui| {
-                                    let _ = ui.selectable_label(vybrano, hw.label());
-                                })
-                                .response
-                                .on_hover_text("není v tomhle sestavení - chce Linux a feature `rsp1`");
-                            }
-                        }
-                    });
-                if let Some(hw) = switch_hw {
-                    self.set.hardware = hw;
-                    // Nové rádio má jiný rozsah - přeladit do něj, ať SoftRock
-                    // nezůstane viset na kmitočtu, kam dosáhne jen RSP1.
-                    self.set_vfo(self.set.vfo_khz);
-                    // SoftRock WFM neumí - přepni na AM, ať nezní šum z prázdné FM.
-                    if self.set.mode.is_wfm() && hw != source::Hardware::Rsp1 {
-                        self.set.mode = dsp::Mode::Am;
-                    }
-                    self.request_reopen();
-                }
-
-                // Ovládání specifické pro RSP1 patří na panel, ne do nastavení -
-                // zisk se ladí za poslechu, vzorkovačka mění šířku panoramatu.
-                if self.set.hardware == source::Hardware::Rsp1 {
-                    ui.separator();
-                    if let Some(g) = *self.shared.gain_range.lock().unwrap() {
-                        ui.label("zisk:");
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut self.set.rsp1_gain_db, g.min..=g.max)
-                                    .fixed_decimals(1)
-                                    .suffix(" dB"),
-                            )
-                            .on_hover_text("zesílení LNA - projeví se hned")
-                            .changed()
-                        {
-                            let _ = self.gain_tx.send(self.set.rsp1_gain_db);
-                        }
-                    }
-                    let puvodni = self.set.rsp1_rate_hz;
-                    egui::ComboBox::from_id_salt("rsp1_rate_top")
-                        .selected_text(format!("{:.3} MHz", puvodni / 1e6))
-                        .show_ui(ui, |ui| {
-                            for &r in source::RSP1_RATES_HZ {
-                                ui.selectable_value(
-                                    &mut self.set.rsp1_rate_hz,
-                                    r,
-                                    format!("{:.3} MHz · panorama {:.0} kHz", r / 1e6, r / 1000.0),
-                                );
-                            }
-                        });
-                    if self.set.rsp1_rate_hz != puvodni {
-                        self.request_reopen();
-                    }
-                }
-
-                ui.separator();
-                ui.label("hlasitost:");
-                ui.add(egui::Slider::new(&mut self.set.volume, 0.0..=1.0).show_value(false));
-                ui.separator();
-                ui.checkbox(&mut self.set.swap_iq, "prohodit I/Q");
-                ui.checkbox(&mut self.set.show_bandplan, "bandplan")
-                    .on_hover_text("podbarvení úseků pásem (IARU R1)");
-                ui.checkbox(&mut self.set.show_console, "konzole")
-                    .on_hover_text("dekódovaný text z RTTY a CW");
-                if ui
-                    .button("⚙ nastavení")
-                    .on_hover_text("zvuková zařízení, bitová hloubka, Si570")
-                    .clicked()
-                {
-                    self.show_options = !self.show_options;
-                }
-                ui.separator();
-                {
-                    let (bw_min, bw_max) = radio::bandwidth_range(self.set.mode);
-                    let mut bw_khz = self.bandwidth_hz() / 1000.0;
-                    // U WFM jsou to stovky kHz, tam desetiny nedávají smysl.
-                    let wfm = self.set.mode.is_wfm();
-                    let resp = ui.add(
-                        egui::Slider::new(&mut bw_khz, bw_min / 1000.0..=bw_max / 1000.0)
-                            .text("šířka [kHz]")
-                            .fixed_decimals(if wfm { 0 } else { 1 }),
-                    );
-                    if resp.changed() {
-                        self.set_bandwidth_hz(bw_khz * 1000.0);
-                    }
-                    if wfm {
-                        resp.on_hover_text(
-                            "šířka mezifrekvenční propusti\n\
-                             úžeji = odolnější proti sousední stanici, ale zkreslenější zvuk",
-                        );
-                    }
-                    ui.separator();
-                }
-                ui.label("zoom:");
-                if ui.button("−").clicked() {
-                    self.set_zoom(self.set.zoom / 2.0);
-                }
-                ui.label(format!("{:.0}×", self.set.zoom));
-                if ui.button("+").clicked() {
-                    self.set_zoom(self.set.zoom * 2.0);
-                }
-                if ui
-                    .button("celé")
-                    .on_hover_text("oddálit na celou vzorkovačku (nebo Ctrl+kolečko)")
-                    .clicked()
-                {
-                    self.set_zoom(1.0);
-                }
-                ui.separator();
-                ui.label("dB rozsah:");
-                ui.add(egui::Slider::new(&mut self.set.db_min, -140.0..=-40.0).text("min"));
-                ui.add(egui::Slider::new(&mut self.set.db_max, -60.0..=0.0).text("max"));
+                skupina(ui, "zvuk", |ui| self.grp_zvuk(ui));
+                skupina(ui, "zobrazení", |ui| self.grp_zobrazeni(ui));
+                skupina(ui, "rádio", |ui| self.grp_radio(ui));
+                skupina(ui, "akce", |ui| self.grp_akce(ui, &bins, span_hz));
             });
-            ui.add_space(2.0);
-            // Zvuk a skenování zvlášť, a navíc sbalitelně - ovládání je toho
-            // hodně a při běžném poslechu se do většiny z něj nesahá.
-            let audio_row = egui::CollapsingHeader::new("zvuk a skenování")
-                .default_open(self.set.show_audio_row)
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        self.agc_controls(ui);
-                        ui.separator();
-                        self.notch_controls(ui);
-                        ui.separator();
-                        self.record_controls(ui);
-                        ui.separator();
-                        self.scan_controls(ui, span_hz);
-                        // Stereo jen ve WFM - jinde by přepínač nic nedělal.
-                        if self.set.mode.is_wfm() {
-                            ui.separator();
-                            self.wfm_controls(ui);
-                        }
-                    });
-                });
-            // Jestli je sekce rozbalená, si pamatujeme do příště.
-            self.set.show_audio_row = audio_row.openness > 0.5;
             ui.add_space(2.0);
             self.band_buttons(ui, tuned_khz);
             ui.add_space(4.0);
@@ -2539,15 +2621,16 @@ impl eframe::App for App {
             }
 
             // Vodorovná mřížka po dB
-            let db_step = nice_db_step(self.set.db_max - self.set.db_min);
-            let first = (self.set.db_min / db_step).ceil() * db_step;
+            let (db_lo, db_hi) = self.set.db_range();
+            let db_step = nice_db_step(db_hi - db_lo);
+            let first = (db_lo / db_step).ceil() * db_step;
             let mut db = first;
-            while db <= self.set.db_max {
-                let t = (db - self.set.db_min) / (self.set.db_max - self.set.db_min);
+            while db <= db_hi {
+                let t = (db - db_lo) / (db_hi - db_lo);
                 let y = rect.bottom() - rect.height() * t;
                 painter.line_segment(
                     [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(45)),
+                    egui::Stroke::new(1.0, GRID),
                 );
                 painter.text(
                     egui::pos2(rect.left() + 3.0, y),
@@ -2575,7 +2658,7 @@ impl eframe::App for App {
             for &(x, _) in &grid_lines {
                 painter.line_segment(
                     [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(45)),
+                    egui::Stroke::new(1.0, GRID),
                 );
             }
 
@@ -2600,8 +2683,7 @@ impl eframe::App for App {
                     self.bandwidth_hz(),
                     self.set.cw_squelch_db,
                 ) {
-                    let t = ((thr - self.set.db_min) / (self.set.db_max - self.set.db_min))
-                        .clamp(0.0, 1.0);
+                    let t = ((thr - db_lo) / (db_hi - db_lo)).clamp(0.0, 1.0);
                     let y = rect.bottom() - rect.height() * t;
                     painter.line_segment(
                         [
@@ -2624,9 +2706,7 @@ impl eframe::App for App {
             // dBFS - stejná stupnice jako panorama i S-metr - tak leží přímo
             // na dB ose. Čára jde přes propustné pásmo, kterého se squelch týká.
             if self.set.squelch_on {
-                let t = ((self.set.squelch_db - self.set.db_min)
-                    / (self.set.db_max - self.set.db_min))
-                    .clamp(0.0, 1.0);
+                let t = ((self.set.squelch_db - db_lo) / (db_hi - db_lo)).clamp(0.0, 1.0);
                 let y = rect.bottom() - rect.height() * t;
                 painter.line_segment(
                     [egui::pos2(bw_rect.left(), y), egui::pos2(bw_rect.right(), y)],
@@ -2673,8 +2753,7 @@ impl eframe::App for App {
                 .map(|i| {
                     let hz = (i as f64 / n as f64 - 0.5) * span_hz;
                     let db = bins[i];
-                    let t = ((db - self.set.db_min) / (self.set.db_max - self.set.db_min))
-                        .clamp(0.0, 1.0);
+                    let t = ((db - db_lo) / (db_hi - db_lo)).clamp(0.0, 1.0);
                     egui::pos2(x_of(&rect, hz), rect.bottom() - rect.height() * t)
                 })
                 .collect();

@@ -77,8 +77,15 @@ pub struct Settings {
     pub bandwidth_wfm_hz: f64,
     pub volume: f32,
     pub swap_iq: bool,
-    pub db_min: f32,
-    pub db_max: f32,
+    /// Rozsah panoramatu v dB - zvlášť pro každé rádio.
+    ///
+    /// SoftRock bere I/Q ze zvukovky, RSP1 má vlastní LNA a jiný převodník,
+    /// takže úrovně leží úplně jinde. Jedna společná hodnota by se musela
+    /// po každém přepnutí rádia znovu seřizovat.
+    pub db_min_softrock: f32,
+    pub db_max_softrock: f32,
+    pub db_min_rsp1: f32,
+    pub db_max_rsp1: f32,
     pub window_w: f32,
     pub window_h: f32,
     /// Přiblížení panoramatu: 1 = celá vzorkovačka, 8 = osmina.
@@ -106,8 +113,6 @@ pub struct Settings {
     /// Přehrávat VKV rozhlas ve stereu? Bez pilotu se stejně jede mono.
     pub stereo: bool,
     pub show_console: bool,
-    /// Je rozbalená sekce se zvukem a skenováním?
-    pub show_audio_row: bool,
     pub stations: Vec<Station>,
     /// Poslední místo na každém pásmu, klíčem je název z bandplanu.
     /// BTreeMap kvůli stabilnímu pořadí v souboru.
@@ -136,8 +141,10 @@ impl Default for Settings {
             bandwidth_wfm_hz: crate::radio::WFM_BANDWIDTH_HZ,
             volume: 0.5,
             swap_iq: false,
-            db_min: -110.0,
-            db_max: -20.0,
+            db_min_softrock: -110.0,
+            db_max_softrock: -20.0,
+            db_min_rsp1: -110.0,
+            db_max_rsp1: -20.0,
             window_w: 1100.0,
             window_h: 700.0,
             zoom: 1.0,
@@ -153,7 +160,6 @@ impl Default for Settings {
             notch_hz: 1_000.0,
             stereo: true,
             show_console: false,
-            show_audio_row: true,
             stations: Vec::new(),
             band_memory: BTreeMap::new(),
         }
@@ -169,6 +175,27 @@ impl Settings {
             Mode::Am => self.bandwidth_am_hz,
             Mode::Nfm => self.bandwidth_nfm_hz,
             Mode::Wfm => self.bandwidth_wfm_hz,
+        }
+    }
+
+    /// Rozsah panoramatu v dB pro právě zvolené rádio.
+    pub fn db_range(&self) -> (f32, f32) {
+        match self.hardware {
+            Hardware::Rsp1 => (self.db_min_rsp1, self.db_max_rsp1),
+            _ => (self.db_min_softrock, self.db_max_softrock),
+        }
+    }
+
+    pub fn set_db_range(&mut self, min: f32, max: f32) {
+        match self.hardware {
+            Hardware::Rsp1 => {
+                self.db_min_rsp1 = min;
+                self.db_max_rsp1 = max;
+            }
+            _ => {
+                self.db_min_softrock = min;
+                self.db_max_softrock = max;
+            }
         }
     }
 
@@ -353,8 +380,10 @@ mod tests {
             bandwidth_wfm_hz: 150_000.0,
             volume: 0.33,
             swap_iq: true,
-            db_min: -120.0,
-            db_max: -30.0,
+            db_min_softrock: -120.0,
+            db_max_softrock: -30.0,
+            db_min_rsp1: -95.0,
+            db_max_rsp1: -15.0,
             window_w: 1280.0,
             window_h: 800.0,
             zoom: 4.0,
@@ -370,7 +399,6 @@ mod tests {
             notch_hz: 1_200.0,
             stereo: false,
             show_console: true,
-            show_audio_row: false,
             band_memory: BTreeMap::new(),
             stations: vec![
                 Station {
@@ -467,6 +495,48 @@ mod tests {
         assert_eq!(back.band_memory.len(), 2);
         assert_eq!(back.band_memory["20 m"].mode, Mode::Usb);
         assert_eq!(back.band_memory["41 m"].freq_khz, 7300.0);
+    }
+
+    /// Každé rádio má vlastní rozsah panoramatu.
+    ///
+    /// SoftRock jede přes zvukovku, RSP1 má vlastní LNA - úrovně leží úplně
+    /// jinde. Se společnou hodnotou by se rozsah musel po každém přepnutí
+    /// znovu seřizovat, což je při přepínání za běhu otrava.
+    #[test]
+    fn rozsah_db_je_pro_kazde_radio_zvlast() {
+        let mut s = Settings {
+            hardware: Hardware::SoftRock,
+            ..Settings::default()
+        };
+        s.set_db_range(-115.0, -25.0);
+
+        s.hardware = Hardware::Rsp1;
+        s.set_db_range(-90.0, -10.0);
+        assert_eq!(s.db_range(), (-90.0, -10.0), "RSP1 si nedrží svůj rozsah");
+
+        // Přepnutí zpátky nesmí hodnotu toho druhého přepsat.
+        s.hardware = Hardware::SoftRock;
+        assert_eq!(
+            s.db_range(),
+            (-115.0, -25.0),
+            "SoftRocku se rozsah změnil přepnutím na RSP1"
+        );
+    }
+
+    /// Rozsah musí přežít uložení a načtení, jinak by se po restartu
+    /// stejně obě rádia zase srovnala na jednu hodnotu.
+    #[test]
+    fn rozsahy_db_prezijou_ulozeni() {
+        let mut s = Settings::default();
+        s.db_min_softrock = -118.0;
+        s.db_max_softrock = -22.0;
+        s.db_min_rsp1 = -93.0;
+        s.db_max_rsp1 = -13.0;
+        let back: Settings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
+        assert_eq!(back.db_min_softrock, -118.0);
+        assert_eq!(back.db_max_softrock, -22.0);
+        assert_eq!(back.db_min_rsp1, -93.0);
+        assert_eq!(back.db_max_rsp1, -13.0);
     }
 
     #[test]

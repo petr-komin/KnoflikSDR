@@ -36,11 +36,19 @@ jeden statický binár místo Pythonu s C rozšířením.
   Orientačně se dá odchylka odečíst i ze stereo pilotu na VKV
 - **Bandplan i pro VKV/UHF** — s RSP1 se ladí souvisle do 2 GHz; vyznačená amatérská pásma
   6 m / 2 m / 70 cm / 23 cm, FM rozhlas i orientační DAB/DVB-T
+- **Bezlicenční kmitočty** podle všeobecných oprávnění ČTÚ — CB 27 MHz, sdílené kanály
+  kolem 77 MHz a 173 MHz, 442 a 448 MHz i PMR446. Slouží k orientaci; pro vysílání
+  si vždycky ověř aktuální znění VO-R
 - **Velké skoky ladění** — na RSP1 tlačítka ±10 k / ±100 k / ±1 M kHz, na SoftRocku jemná
 - **Ladění kliknutím** do spektra i vodopádu, tažením hran se mění šířka pásma
 - **Přímé zadání frekvence** — naladěná hodnota se dá rovnou přepsat, takže se na normál
   nebo převáděč trefíš přesně, ne po krocích
 - **Zoom se soustředí na naladěnou stanici**, takže se přibližuje to, co posloucháš
+- **Ovládání v pojmenovaných skupinách** — ladění, režim, signál, stanice, zvuk,
+  zobrazení, rádio a akce. Nic se neschovává, jen se v tom dá orientovat
+- **Rozsah panoramatu zvlášť pro každé rádio** — SoftRock jede přes zvukovku, RSP1 má
+  vlastní LNA, takže úrovně leží jinde a jedna společná hodnota by se po každém
+  přepnutí seřizovala znovu
 - **Oblíbené stanice** — jedním klikem i s režimem a šířkou filtru
 - **Kdo to vlastně vysílá** — v AM se podle rozpisu EiBi ukáže, která stanice
   má na naladěné frekvenci právě teď být
@@ -88,8 +96,12 @@ Diagnostika bez GUI — ukáže, co si vyjednal vstup a jestli teče signál:
 
 Rádio se přepíná **selectem „rádio:" přímo v liště** — SoftRock ↔ RSP1 se přepne hned za běhu,
 bez restartu. Tlačítko **⚙ nastavení** otevře okno s parametry: vzorkovačka RSP1, zisk, vstupní
-a výstupní zvuková karta, strop bitové hloubky a kalibrace Si570. Nabízí se jen to, co pro
-zvolené rádio dává smysl.
+a výstupní zvuková karta, strop bitové hloubky a kalibrace (Si570 u SoftRocku, ppm u RSP1).
+Nabízí se jen to, co pro zvolené rádio dává smysl.
+
+Ovládání na panelu je rozdělené do pojmenovaných skupin — **ladění, režim, signál, stanice**
+v prvním řádku, **zvuk, zobrazení, rádio, akce** ve druhém. Nic není schované za rozbalováním;
+skupiny se při užším okně jen zalomí.
 
 Přepnutí rádia, vzorkovačky i zisku se projeví **hned**. Změna vstupní zvukovky, hloubky nebo
 Si570 se v okně potvrdí tlačítkem **↻ Použít změny** (taky bez restartu). Jen výstupní zařízení

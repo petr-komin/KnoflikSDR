@@ -13,6 +13,9 @@ pub enum Usage {
     Phone,
     Beacon,
     Broadcast,
+    /// Bezlicenční (sdílené) kmitočty - smí na ně kdokoli s odpovídajícím
+    /// zařízením, bez individuálního oprávnění.
+    LicenceFree,
 }
 
 impl Usage {
@@ -23,6 +26,7 @@ impl Usage {
             Usage::Phone => "fonie",
             Usage::Beacon => "majáky",
             Usage::Broadcast => "rozhlas",
+            Usage::LicenceFree => "bezlicenční",
         }
     }
 
@@ -40,6 +44,10 @@ impl Usage {
             // Tyrkysová: rozhlas byl původně oranžový a splýval s mrtvou
             // zónou kolem VFO, která je taky oranžová.
             Usage::Broadcast => (70, 210, 205),
+            // Žlutozelená - musí se lišit od majáků (oranžová) i od fonie
+            // (zelená), protože bezlicenční kanály leží často hned vedle
+            // amatérských pásem.
+            Usage::LicenceFree => (190, 210, 60),
         }
     }
 
@@ -47,6 +55,9 @@ impl Usage {
     pub fn fill_alpha(&self) -> u8 {
         match self {
             Usage::Broadcast => 45,
+            // Jednotlivé kanály jsou úzké (25 kHz), takže při slabém
+            // podbarvení by na širokém panoramatu zanikly.
+            Usage::LicenceFree => 60,
             _ => 26,
         }
     }
@@ -174,6 +185,45 @@ pub const SEGMENTS: &[Segment] = &[
     seg(470_000.0, 690_000.0, Usage::Broadcast, "UHF TV"),
     // 23 cm
     seg(1_240_000.0, 1_300_000.0, Usage::Phone, "23 cm"),
+    // ---- Bezlicenční (sdílené) kmitočty v ČR ----
+    //
+    // Vychází ze všeobecného oprávnění ČTÚ VO-R/16 (sdílené kmitočty)
+    // a VO-R/12 (CB). Slouží k orientaci v panoramatu, ne k dodržování
+    // předpisů - pro vysílání si vždycky ověř aktuální znění oprávnění,
+    // hlavně povolený výkon a šířku kanálu.
+    //
+    // Kanály jsou úzké, tak jsou zapsané jako 25 kHz kolem středu, aby
+    // v panoramatu vůbec šly vidět.
+    //
+    // CB - souvislé pásmo, 80 kanálů.
+    seg(26_965.0, 27_405.0, Usage::LicenceFree, "CB 27 MHz"),
+    // Pásmo 77 MHz, přenosné stanice do 1 W e.r.p.
+    seg(77_012.5, 77_037.5, Usage::LicenceFree, "77 MHz"),
+    seg(77_037.5, 77_062.5, Usage::LicenceFree, "77 MHz"),
+    seg(77_062.5, 77_087.5, Usage::LicenceFree, "77 MHz"),
+    seg(77_087.5, 77_112.5, Usage::LicenceFree, "77 MHz"),
+    seg(77_712.5, 77_737.5, Usage::LicenceFree, "77 MHz"),
+    seg(77_987.5, 78_012.5, Usage::LicenceFree, "77 MHz"),
+    // Pásmo 172-173 MHz, 1 až 5 W e.r.p. podle kanálu.
+    seg(172_637.5, 172_662.5, Usage::LicenceFree, "173 MHz"),
+    seg(172_712.5, 172_737.5, Usage::LicenceFree, "173 MHz"),
+    seg(172_937.5, 172_962.5, Usage::LicenceFree, "173 MHz"),
+    seg(172_962.5, 172_987.5, Usage::LicenceFree, "173 MHz"),
+    seg(173_037.5, 173_062.5, Usage::LicenceFree, "173 MHz"),
+    // Pásmo 442 MHz.
+    seg(442_037.5, 442_062.5, Usage::LicenceFree, "442 MHz"),
+    seg(442_187.5, 442_212.5, Usage::LicenceFree, "442 MHz"),
+    seg(442_212.5, 442_237.5, Usage::LicenceFree, "442 MHz"),
+    seg(442_237.5, 442_262.5, Usage::LicenceFree, "442 MHz"),
+    seg(442_262.5, 442_287.5, Usage::LicenceFree, "442 MHz"),
+    // PMR446 - souvislé pásmo, 16 kanálů po 12,5 kHz, 0,5 W.
+    seg(446_006.25, 446_193.75, Usage::LicenceFree, "PMR446"),
+    // Pásmo 448-449 MHz.
+    seg(448_477.5, 448_502.5, Usage::LicenceFree, "448 MHz"),
+    seg(448_557.5, 448_582.5, Usage::LicenceFree, "448 MHz"),
+    seg(448_597.5, 448_622.5, Usage::LicenceFree, "448 MHz"),
+    seg(449_757.5, 449_782.5, Usage::LicenceFree, "448 MHz"),
+    seg(449_797.5, 449_822.5, Usage::LicenceFree, "448 MHz"),
 ];
 
 /// Celé pásmo poskládané ze svých úseků.
@@ -278,6 +328,16 @@ mod tests {
     #[test]
     fn pasma_jsou_souvisla() {
         for b in bands() {
+            // Bezlicenční pásma jsou schválně nesouvislá - je to hrstka
+            // izolovaných kanálů po 25 kHz, ne jeden spojitý úsek. Na ně
+            // tahle úvaha neplatí, hlídá je `bezlicencni_kanaly_sedi_na_vo_r`.
+            if SEGMENTS
+                .iter()
+                .filter(|s| s.band == b.name)
+                .all(|s| s.usage == Usage::LicenceFree)
+            {
+                continue;
+            }
             let pokryto: f64 = SEGMENTS
                 .iter()
                 .filter(|s| s.band == b.name)
@@ -291,6 +351,34 @@ mod tests {
                 b.name
             );
         }
+    }
+
+    /// Bezlicenční kanály musí sedět na všeobecné oprávnění ČTÚ.
+    ///
+    /// Přídělová tabulka je fakt, ne odhad - když se v ní udělá překlep,
+    /// ukazuje panorama kanál jinde, než doopravdy je. Proto se tu vyjmenují
+    /// oficiální středy a ověří, že na každém z nich úsek opravdu leží.
+    #[test]
+    fn bezlicencni_kanaly_sedi_na_vo_r() {
+        // VO-R/16: sdílené kmitočty, středy kanálů v kHz.
+        let stredy = [
+            77_025.0, 77_050.0, 77_075.0, 77_100.0, 77_725.0, 78_000.0,
+            172_650.0, 172_725.0, 172_950.0, 172_975.0, 173_050.0,
+            442_050.0, 442_200.0, 442_225.0, 442_250.0, 442_275.0,
+            448_490.0, 448_570.0, 448_610.0, 449_770.0, 449_810.0,
+        ];
+        for f in stredy {
+            let s = at(f).unwrap_or_else(|| panic!("na {f} kHz chybí bezlicenční kanál"));
+            assert_eq!(
+                s.usage,
+                Usage::LicenceFree,
+                "{f} kHz má být bezlicenční, je {}",
+                s.usage.label()
+            );
+        }
+        // CB i PMR446 jsou souvislá pásma, ne jednotlivé kanály.
+        assert_eq!(at(27_185.0).unwrap().usage, Usage::LicenceFree, "CB kanál 19");
+        assert_eq!(at(446_100.0).unwrap().usage, Usage::LicenceFree, "PMR446");
     }
 
     #[test]
